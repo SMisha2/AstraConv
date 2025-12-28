@@ -1,1 +1,39 @@
 
+name: Build and Release AstraKeys
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pyqt6
+          pip install mido pyperclip psutil
+          pip install pyinstaller pywin32 pynput requests PyQt6
+
+
+      - name: Build EXE
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --icon=assets/icon.ico AstraKeys.py
+        shell: cmd
+
+      - name: Upload Release Artifact
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/AstraKeys.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
