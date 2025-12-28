@@ -34,6 +34,6 @@ jobs:
       - name: Upload Release Artifact
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/AstraKeys.exe
+          files: dist/AstraConv.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
