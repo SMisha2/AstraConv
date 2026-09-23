@@ -32,14 +32,12 @@ jobs:
       - name: Remove unused models and heavy extras
         shell: pwsh
         run: |
-          # Оставляем только ONNX-модель
           $py_path = python -c "import basic_pitch, os; print(os.path.dirname(basic_pitch.__file__))"
           $model_dir = Join-Path $py_path "saved_models\icassp_2022"
           if (Test-Path "$model_dir\nmp")        { Remove-Item -Recurse -Force "$model_dir\nmp" }
           if (Test-Path "$model_dir\nmp.tflite") { Remove-Item -Force "$model_dir\nmp.tflite" }
 
-          # Убираем тяжёлое, что basic-pitch не использует в рантайме.
-          # scipy не трогаем — mir_eval требует scipy.sparse / stats.
+          # Только то, что точно не нужно в рантайме basic-pitch
           python -m pip uninstall -y numba llvmlite 2>$null
           python -m pip uninstall -y scikit-learn 2>$null
           python -m pip uninstall -y matplotlib pandas IPython 2>$null
@@ -80,10 +78,12 @@ jobs:
             --collect-all resampy `
             --collect-all pretty_midi `
             --collect-submodules scipy `
+            --collect-submodules mir_eval `
             --hidden-import tkinterdnd2 `
             --hidden-import mido `
             --hidden-import onnxruntime `
             --hidden-import numpy `
+            --hidden-import numpy.testing `
             --hidden-import scipy `
             --hidden-import scipy.sparse `
             --hidden-import scipy.sparse.linalg `
@@ -91,6 +91,7 @@ jobs:
             --hidden-import scipy.stats `
             --hidden-import mir_eval `
             --hidden-import requests `
+            --hidden-import unittest `
             --exclude-module tensorflow `
             --exclude-module tensorboard `
             --exclude-module keras `
@@ -108,13 +109,10 @@ jobs:
             --exclude-module numba `
             --exclude-module llvmlite `
             --exclude-module librosa.tests `
-            --exclude-module numpy.tests `
             --exclude-module PyQt5 `
             --exclude-module PyQt6 `
             --exclude-module PySide2 `
             --exclude-module PySide6 `
-            --exclude-module tkinter.test `
-            --exclude-module unittest `
             AstraConv.py
 
       - name: Report size
