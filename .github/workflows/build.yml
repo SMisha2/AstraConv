@@ -22,28 +22,34 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install minimal dependencies
         run: |
           python -m pip install --upgrade pip
           pip install mido tkinterdnd2 requests
           pip install basic-pitch[onnx] onnxruntime
-          pip install numpy pretty_midi
           pip install pyinstaller
 
-      - name: Trim unused basic-pitch models
+      - name: Remove unused models and heavy extras
         shell: pwsh
         run: |
+          # Оставляем только ONNX-модель
           $py_path = python -c "import basic_pitch, os; print(os.path.dirname(basic_pitch.__file__))"
           $model_dir = Join-Path $py_path "saved_models\icassp_2022"
-          if (Test-Path "$model_dir\nmp") { Remove-Item -Recurse -Force "$model_dir\nmp" }
+          if (Test-Path "$model_dir\nmp")        { Remove-Item -Recurse -Force "$model_dir\nmp" }
           if (Test-Path "$model_dir\nmp.tflite") { Remove-Item -Force "$model_dir\nmp.tflite" }
-          if (Test-Path "$model_dir\nmp.onnx") { Write-Host "ONNX model kept: $model_dir\nmp.onnx" }
 
-      - name: Verify main file exists
+          # Удаляем numba и llvmlite (не нужны basic-pitch)
+          python -m pip uninstall -y numba llvmlite 2>$null
+          # Удаляем sklearn (тянется librosa по инерции)
+          python -m pip uninstall -y scikit-learn 2>$null
+          # Удаляем matplotlib, pandas, IPython (часто лезут как транзитивные)
+          python -m pip uninstall -y matplotlib pandas IPython 2>$null
+
+      - name: Verify main file
         shell: pwsh
         run: |
           if (!(Test-Path "AstraConv.py")) {
-            Write-Error "AstraConv.py не найден в корне репозитория"
+            Write-Error "AstraConv.py не найден в корне"
             exit 1
           }
 
@@ -53,26 +59,26 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile upx.zip
           Expand-Archive upx.zip -DestinationPath .
           $upx = Get-ChildItem -Path . -Filter upx.exe -Recurse | Select-Object -First 1
-          Write-Host "UPX found at: $($upx.FullName)"
           echo "UPX_DIR=$($upx.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build EXE
         shell: pwsh
         run: |
           $iconArg = @()
-          if (Test-Path "assets/icon.ico") {
-            $iconArg = @("--icon=assets/icon.ico")
-          }
+          if (Test-Path "assets/icon.ico") { $iconArg = @("--icon=assets/icon.ico") }
 
           pyinstaller `
             --noconfirm --clean --onefile --noconsole `
             --name AstraConv `
             --upx-dir=$env:UPX_DIR `
+            --upx-exclude=python3.dll `
+            --upx-exclude=vcruntime140.dll `
+            --upx-exclude=vcruntime140_1.dll `
             @iconArg `
             --collect-all basic_pitch `
             --collect-all librosa `
-            --collect-all resampy `
             --collect-all soundfile `
+            --collect-all resampy `
             --collect-all pretty_midi `
             --hidden-import tkinterdnd2 `
             --hidden-import mido `
@@ -94,10 +100,17 @@ jobs:
             --exclude-module pytest `
             --exclude-module sphinx `
             --exclude-module sklearn `
-            --exclude-module sklearn.tests `
+            --exclude-module numba `
+            --exclude-module llvmlite `
             --exclude-module librosa.tests `
             --exclude-module numpy.tests `
             --exclude-module scipy.tests `
+            --exclude-module scipy.sparse `
+            --exclude-module scipy.spatial `
+            --exclude-module scipy.integrate `
+            --exclude-module scipy.optimize `
+            --exclude-module scipy.interpolate `
+            --exclude-module scipy.linalg `
             --exclude-module PyQt5 `
             --exclude-module PyQt6 `
             --exclude-module PySide2 `
@@ -106,28 +119,24 @@ jobs:
             --exclude-module unittest `
             AstraConv.py
 
-      - name: Check build result
+      - name: Report size
         shell: pwsh
         run: |
-          if (!(Test-Path "dist/AstraConv.exe")) {
-            Write-Error "Сборка не создала dist/AstraConv.exe"
-            exit 1
-          }
           $f = Get-Item "dist/AstraConv.exe"
           $mb = [math]::Round($f.Length / 1MB, 1)
           Write-Host "Итоговый размер: $mb МБ"
-          if ($mb -gt 250) {
-            Write-Warning "EXE больше 250 МБ — возможно, подтянулся TensorFlow"
+          if ($mb -gt 120) {
+            Write-Warning "Всё ещё больше 120 МБ — возможно, что-то не исключилось"
           }
 
-      - name: Upload EXE as workflow artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: AstraConv-windows
           path: dist/AstraConv.exe
           if-no-files-found: error
 
-      - name: Create / update GitHub Release
+      - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
