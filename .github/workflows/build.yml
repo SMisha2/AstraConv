@@ -38,11 +38,10 @@ jobs:
           if (Test-Path "$model_dir\nmp")        { Remove-Item -Recurse -Force "$model_dir\nmp" }
           if (Test-Path "$model_dir\nmp.tflite") { Remove-Item -Force "$model_dir\nmp.tflite" }
 
-          # Удаляем numba и llvmlite (не нужны basic-pitch)
+          # Убираем тяжёлое, что basic-pitch не использует в рантайме.
+          # scipy не трогаем — mir_eval требует scipy.sparse / stats.
           python -m pip uninstall -y numba llvmlite 2>$null
-          # Удаляем sklearn (тянется librosa по инерции)
           python -m pip uninstall -y scikit-learn 2>$null
-          # Удаляем matplotlib, pandas, IPython (часто лезут как транзитивные)
           python -m pip uninstall -y matplotlib pandas IPython 2>$null
 
       - name: Verify main file
@@ -80,11 +79,17 @@ jobs:
             --collect-all soundfile `
             --collect-all resampy `
             --collect-all pretty_midi `
+            --collect-submodules scipy `
             --hidden-import tkinterdnd2 `
             --hidden-import mido `
             --hidden-import onnxruntime `
             --hidden-import numpy `
             --hidden-import scipy `
+            --hidden-import scipy.sparse `
+            --hidden-import scipy.sparse.linalg `
+            --hidden-import scipy.sparse.csgraph `
+            --hidden-import scipy.stats `
+            --hidden-import mir_eval `
             --hidden-import requests `
             --exclude-module tensorflow `
             --exclude-module tensorboard `
@@ -104,13 +109,6 @@ jobs:
             --exclude-module llvmlite `
             --exclude-module librosa.tests `
             --exclude-module numpy.tests `
-            --exclude-module scipy.tests `
-            --exclude-module scipy.sparse `
-            --exclude-module scipy.spatial `
-            --exclude-module scipy.integrate `
-            --exclude-module scipy.optimize `
-            --exclude-module scipy.interpolate `
-            --exclude-module scipy.linalg `
             --exclude-module PyQt5 `
             --exclude-module PyQt6 `
             --exclude-module PySide2 `
@@ -125,9 +123,6 @@ jobs:
           $f = Get-Item "dist/AstraConv.exe"
           $mb = [math]::Round($f.Length / 1MB, 1)
           Write-Host "Итоговый размер: $mb МБ"
-          if ($mb -gt 120) {
-            Write-Warning "Всё ещё больше 120 МБ — возможно, что-то не исключилось"
-          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
