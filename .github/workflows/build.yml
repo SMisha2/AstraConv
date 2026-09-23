@@ -1,10 +1,13 @@
-
-name: Build and Release AstraKeys
+name: Build and Release AstraConv
 
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:      # позволяет запустить вручную из вкладки Actions
+
+permissions:
+  contents: write         # нужно для создания release
 
 jobs:
   build:
@@ -14,26 +17,79 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
-          pip install pyqt6
-          pip install mido pyperclip psutil
-          pip install pyinstaller pywin32 pynput requests PyQt6
+          python -m pip install --upgrade pip
+          pip install mido tkinterdnd2
+          pip install basic-pitch[onnx]
+          pip install onnxruntime numpy pretty_midi
+          pip install pyinstaller
 
+      - name: Verify main file exists
+        shell: pwsh
+        run: |
+          if (!(Test-Path "AstraConv.py")) {
+            Write-Error "AstraConv.py не найден в корне репозитория"
+            exit 1
+          }
 
       - name: Build EXE
+        shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile --windowed --icon=assets/icon.ico AstraKeys.py
-        shell: cmd
+          $iconArg = @()
+          if (Test-Path "assets/icon.ico") {
+            $iconArg = @("--icon=assets/icon.ico")
+          }
 
-      - name: Upload Release Artifact
-        uses: softprops/action-gh-release@v1
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --noconsole `
+            --name AstraConv `
+            @iconArg `
+            --collect-all basic_pitch `
+            --collect-all librosa `
+            --collect-all resampy `
+            --collect-all soundfile `
+            --collect-all pretty_midi `
+            --hidden-import tkinterdnd2 `
+            --hidden-import mido `
+            --hidden-import onnxruntime `
+            --hidden-import numpy `
+            --hidden-import scipy `
+            AstraConv.py
+
+      - name: Check build result
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/AstraConv.exe")) {
+            Write-Error "Сборка не создала dist/AstraConv.exe"
+            exit 1
+          }
+          Get-Item dist/AstraConv.exe | Format-List Name, Length
+
+      - name: Upload EXE as workflow artifact
+        uses: actions/upload-artifact@v4
         with:
+          name: AstraConv-windows
+          path: dist/AstraConv.exe
+          if-no-files-found: error
+
+      - name: Create / update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AstraConv ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
           files: dist/AstraConv.exe
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
