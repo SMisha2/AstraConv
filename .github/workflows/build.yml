@@ -4,10 +4,10 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:      # позволяет запустить вручную из вкладки Actions
+  workflow_dispatch:
 
 permissions:
-  contents: write         # нужно для создания release
+  contents: write
 
 jobs:
   build:
@@ -21,12 +21,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install mido tkinterdnd2
+          pip install mido tkinterdnd2 requests
           pip install basic-pitch[onnx]
           pip install onnxruntime numpy pretty_midi
           pip install pyinstaller
@@ -64,6 +63,7 @@ jobs:
             --hidden-import onnxruntime `
             --hidden-import numpy `
             --hidden-import scipy `
+            --hidden-import requests `
             AstraConv.py
 
       - name: Check build result
