@@ -26,9 +26,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install mido tkinterdnd2 requests
-          pip install basic-pitch[onnx]
-          pip install onnxruntime numpy pretty_midi
+          pip install basic-pitch[onnx] onnxruntime
+          pip install numpy pretty_midi
           pip install pyinstaller
+
+      - name: Trim unused basic-pitch models
+        shell: pwsh
+        run: |
+          $py_path = python -c "import basic_pitch, os; print(os.path.dirname(basic_pitch.__file__))"
+          $model_dir = Join-Path $py_path "saved_models\icassp_2022"
+          if (Test-Path "$model_dir\nmp") { Remove-Item -Recurse -Force "$model_dir\nmp" }
+          if (Test-Path "$model_dir\nmp.tflite") { Remove-Item -Force "$model_dir\nmp.tflite" }
+          if (Test-Path "$model_dir\nmp.onnx") { Write-Host "ONNX model kept: $model_dir\nmp.onnx" }
 
       - name: Verify main file exists
         shell: pwsh
@@ -37,6 +46,15 @@ jobs:
             Write-Error "AstraConv.py не найден в корне репозитория"
             exit 1
           }
+
+      - name: Download UPX
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile upx.zip
+          Expand-Archive upx.zip -DestinationPath .
+          $upx = Get-ChildItem -Path . -Filter upx.exe -Recurse | Select-Object -First 1
+          Write-Host "UPX found at: $($upx.FullName)"
+          echo "UPX_DIR=$($upx.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build EXE
         shell: pwsh
@@ -47,11 +65,9 @@ jobs:
           }
 
           pyinstaller `
-            --noconfirm `
-            --clean `
-            --onefile `
-            --noconsole `
+            --noconfirm --clean --onefile --noconsole `
             --name AstraConv `
+            --upx-dir=$env:UPX_DIR `
             @iconArg `
             --collect-all basic_pitch `
             --collect-all librosa `
@@ -64,6 +80,30 @@ jobs:
             --hidden-import numpy `
             --hidden-import scipy `
             --hidden-import requests `
+            --exclude-module tensorflow `
+            --exclude-module tensorboard `
+            --exclude-module keras `
+            --exclude-module torch `
+            --exclude-module torchaudio `
+            --exclude-module torchvision `
+            --exclude-module matplotlib `
+            --exclude-module IPython `
+            --exclude-module jupyter `
+            --exclude-module notebook `
+            --exclude-module pandas `
+            --exclude-module pytest `
+            --exclude-module sphinx `
+            --exclude-module sklearn `
+            --exclude-module sklearn.tests `
+            --exclude-module librosa.tests `
+            --exclude-module numpy.tests `
+            --exclude-module scipy.tests `
+            --exclude-module PyQt5 `
+            --exclude-module PyQt6 `
+            --exclude-module PySide2 `
+            --exclude-module PySide6 `
+            --exclude-module tkinter.test `
+            --exclude-module unittest `
             AstraConv.py
 
       - name: Check build result
@@ -73,7 +113,12 @@ jobs:
             Write-Error "Сборка не создала dist/AstraConv.exe"
             exit 1
           }
-          Get-Item dist/AstraConv.exe | Format-List Name, Length
+          $f = Get-Item "dist/AstraConv.exe"
+          $mb = [math]::Round($f.Length / 1MB, 1)
+          Write-Host "Итоговый размер: $mb МБ"
+          if ($mb -gt 250) {
+            Write-Warning "EXE больше 250 МБ — возможно, подтянулся TensorFlow"
+          }
 
       - name: Upload EXE as workflow artifact
         uses: actions/upload-artifact@v4
