@@ -22,25 +22,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install minimal dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install mido tkinterdnd2 requests
           pip install basic-pitch[onnx] onnxruntime
           pip install pyinstaller
 
-      - name: Remove unused models and heavy extras
+      - name: Verify import chain works
+        run: |
+          python -c "import basic_pitch.inference; import numba; import resampy; import mir_eval; print('all imports OK')"
+
+      - name: Trim unused ONNX/TF models
         shell: pwsh
         run: |
           $py_path = python -c "import basic_pitch, os; print(os.path.dirname(basic_pitch.__file__))"
           $model_dir = Join-Path $py_path "saved_models\icassp_2022"
           if (Test-Path "$model_dir\nmp")        { Remove-Item -Recurse -Force "$model_dir\nmp" }
           if (Test-Path "$model_dir\nmp.tflite") { Remove-Item -Force "$model_dir\nmp.tflite" }
-
-          # Только то, что точно не нужно в рантайме basic-pitch
-          python -m pip uninstall -y numba llvmlite 2>$null
-          python -m pip uninstall -y scikit-learn 2>$null
-          python -m pip uninstall -y matplotlib pandas IPython 2>$null
+          Write-Host "ONNX model kept:"
+          Get-ChildItem $model_dir
 
       - name: Verify main file
         shell: pwsh
@@ -76,9 +77,11 @@ jobs:
             --collect-all librosa `
             --collect-all soundfile `
             --collect-all resampy `
+            --collect-all numba `
+            --collect-all llvmlite `
             --collect-all pretty_midi `
+            --collect-all mir_eval `
             --collect-submodules scipy `
-            --collect-submodules mir_eval `
             --hidden-import tkinterdnd2 `
             --hidden-import mido `
             --hidden-import onnxruntime `
@@ -89,9 +92,14 @@ jobs:
             --hidden-import scipy.sparse.linalg `
             --hidden-import scipy.sparse.csgraph `
             --hidden-import scipy.stats `
+            --hidden-import numba `
+            --hidden-import llvmlite `
+            --hidden-import resampy `
             --hidden-import mir_eval `
             --hidden-import requests `
             --hidden-import unittest `
+            --hidden-import pkg_resources `
+            --hidden-import setuptools `
             --exclude-module tensorflow `
             --exclude-module tensorboard `
             --exclude-module keras `
@@ -105,10 +113,6 @@ jobs:
             --exclude-module pandas `
             --exclude-module pytest `
             --exclude-module sphinx `
-            --exclude-module sklearn `
-            --exclude-module numba `
-            --exclude-module llvmlite `
-            --exclude-module librosa.tests `
             --exclude-module PyQt5 `
             --exclude-module PyQt6 `
             --exclude-module PySide2 `
