@@ -1,2418 +1,1503 @@
+# AstraConv v0.0.6 - Полностью исправленная версия
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import os, io, sys, time, json, tempfile, contextlib, traceback, threading
-import subprocess
-from pathlib import Path
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import threading
+import time
+import os
+import json
+import webbrowser
+import platform
+import math
+import random
+import sys
+from datetime import datetime
 
-import logging, warnings
+# Глобальные переменные для раскладки
+white_keys = '1234567890qwertyuiopasdfghjklzxcvbnm'  # 36 символов
+black_keys = '!@$%^*(QWETYIOPSDGHJLZCVB'           # 24 символа
+BASE_NOTE = 36  # C2 - первая белая клавиша '1'
+WHITE_NOTE_POSITIONS = [0, 2, 4, 5, 7, 9, 11]  # C, D, E, F, G, A, B
+BLACK_NOTE_POSITIONS = [1, 3, 6, 8, 10]        # C#, D#, F#, G#, A#
 
-logging.disable(logging.CRITICAL)
-for _h in logging.root.handlers[:]:
-    logging.root.removeHandler(_h)
-logging.root.addHandler(logging.NullHandler())
-logging.root.setLevel(logging.CRITICAL + 10)
-logging.root.propagate = False
-warnings.filterwarnings("ignore")
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["PYTHONWARNINGS"] = "ignore"
+def note_to_char(note):
+    """Конвертация MIDI ноты в символ клавиши с учетом раскладки"""
+    octave = (note - BASE_NOTE) // 12
+    note_in_octave = note % 12
+    
+    if note_in_octave in WHITE_NOTE_POSITIONS:
+        pos_in_octave = WHITE_NOTE_POSITIONS.index(note_in_octave)
+        index = octave * 7 + pos_in_octave
+        if 0 <= index < len(white_keys):
+            return white_keys[index]
+    elif note_in_octave in BLACK_NOTE_POSITIONS:
+        pos_in_octave = BLACK_NOTE_POSITIONS.index(note_in_octave)
+        index = octave * 5 + pos_in_octave
+        if 0 <= index < len(black_keys):
+            return black_keys[index]
+    return ''
 
-try:
-    import mido
-except ImportError:
-    mido = None
-
-try:
-    import requests
-except ImportError:
-    requests = None
-
-from dataclasses import dataclass
-from typing import Dict, Optional, List, Tuple, Set
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                          VERSION / UPDATE
-# ═══════════════════════════════════════════════════════════════════
-
-CURRENT_VERSION = "0.0.1"
-GITHUB_OWNER = "SMisha2"
-GITHUB_REPO = "AstraConv"
-ASSET_NAME = "AstraConv.exe"
-SETTINGS_FILE = "astraconv_settings.json"
-
-
-def version_tuple(v):
-    try:
-        parts = []
-        for p in str(v).strip().lstrip("v").split("."):
-            num = ""
-            for ch in p:
-                if ch.isdigit():
-                    num += ch
+class MidiProcessor:
+    """Отдельный класс для обработки MIDI файлов с поддержкой игровых форматов"""
+    def __init__(self, settings=None):
+        self.settings = settings or {}
+        self.game_formats = {
+            "minecraft": self._process_for_minecraft,
+            "roblox": self._process_for_roblox,
+            "terraria": self._process_for_terraria
+        }
+    
+    def process_midi(self, midi_path, game_format=None):
+        """Универсальная обработка с поддержкой игровых форматов"""
+        try:
+            import mido
+            from mido import MidiFile, tick2second
+            
+            mid = MidiFile(midi_path)
+            
+            # Собираем события
+            events = []
+            total_notes = 0
+            max_notes = self.settings.get('max_notes', 100000)
+            
+            for track in mid.tracks:
+                abs_time = 0
+                for msg in track:
+                    abs_time += msg.time
+                    sec_time = tick2second(abs_time, mid.ticks_per_beat, 500000)
+                    if hasattr(msg, 'type') and msg.type == 'note_on' and hasattr(msg, 'velocity') and msg.velocity > 0:
+                        total_notes += 1
+                        if total_notes > max_notes:
+                            return f"Файл слишком большой! Максимальное количество нот: {max_notes}. Ваш файл содержит {total_notes} нот."
+                        
+                        if game_format:
+                            events.append((sec_time, msg.note, msg.velocity))
+                        else:
+                            char = note_to_char(msg.note)
+                            if char:
+                                events.append((sec_time, char))
+            
+            # Для игровых форматов используем специальную обработку
+            if game_format and game_format in self.game_formats:
+                return self.game_formats[game_format](mid, events)
+            else:
+                return self._process_standard(events)
+                
+        except Exception as e:
+            return f"Ошибка обработки: {str(e)}"
+    
+    def _process_standard(self, events):
+        """Стандартная обработка MIDI файла с группировкой в аккорды"""
+        if not events:
+            return "Нет обнаруженных нот для обработки."
+        
+        # Сортируем события по времени
+        events.sort(key=lambda x: x[0])
+        
+        # Группируем ноты в аккорды
+        output = []
+        current_time = events[0][0]
+        current_chord = []
+        chord_threshold = self.settings.get('chord_threshold', 0.025)
+        detail_level = self.settings.get('detail_level', 'medium')
+        space_between_chords = self.settings.get('space_between_chords', True)
+        
+        # Добавляем первую ноту
+        current_chord.append(events[0][1])
+        
+        for i in range(1, len(events)):
+            time_diff = events[i][0] - current_time
+            
+            if time_diff <= chord_threshold:
+                current_chord.append(events[i][1])
+            else:
+                # Обработка текущего аккорда/ноты
+                self._process_chord(current_chord, output, detail_level)
+                
+                # Добавляем пробел между аккордами если нужно
+                if space_between_chords and output:
+                    output.append(' ')
+                
+                current_chord = [events[i][1]]
+                current_time = events[i][0]
+        
+        # Обработка последнего аккорда/ноты
+        if current_chord:
+            self._process_chord(current_chord, output, detail_level)
+        
+        return ''.join(output)
+    
+    def _process_chord(self, chord, output, detail_level):
+        """Обработка одного аккорда в зависимости от уровня детализации"""
+        if detail_level == 'high':
+            # Максимальная детализация - каждая нота отдельно
+            for note in chord:
+                output.append(note)
+        elif detail_level == 'low':
+            # Минимальная детализация - объединяем близкие ноты
+            if len(chord) > 3:
+                main_notes = sorted(set(chord))[:3]
+                output.append(f"[{''.join(main_notes)}]")
+            else:
+                if len(chord) > 1:
+                    output.append(f"[{''.join(sorted(set(chord)))}]")
                 else:
-                    break
-            parts.append(int(num) if num else 0)
-        while len(parts) < 3:
-            parts.append(0)
-        return tuple(parts[:3])
-    except Exception:
-        return (0, 0, 0)
-
-
-def fetch_latest_release_info():
-    """Запрашивает последний релиз с GitHub API."""
-    if requests is None:
-        return None, "Библиотека requests не установлена.\nУстановите: pip install requests"
-    api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-    try:
-        r = requests.get(api, timeout=10,
-                         headers={"Accept": "application/vnd.github+json"})
-        if r.status_code == 404:
-            return None, "Релиз не найден на GitHub"
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-
-def download_asset_to_file(url, dest, progress_callback=None,
-                            chunk_size=65536, max_retries=3):
-    """Скачивает файл с прогрессом и повторами."""
-    if requests is None:
-        return False, "requests недоступен"
-    for attempt in range(max_retries):
-        try:
-            with requests.get(url, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                total = r.headers.get("content-length")
-                total = int(total) if total else None
-                written = 0
-                with open(dest, "wb") as f:
-                    for chunk in r.iter_content(chunk_size):
-                        if chunk:
-                            f.write(chunk)
-                            written += len(chunk)
-                            if progress_callback and total:
-                                progress_callback(int(written * 100 // total))
-                if total is None or os.path.getsize(dest) == total:
-                    if progress_callback:
-                        progress_callback(100)
-                    return True, None
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    try:
-                        os.remove(dest)
-                    except Exception:
-                        pass
-                    continue
-                return False, "Размер файла не совпал"
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2)
-                try:
-                    if os.path.exists(dest):
-                        os.remove(dest)
-                except Exception:
-                    pass
+                    output.append(chord[0])
+        else:
+            # Стандартная детализация - обычные аккорды
+            if len(chord) > 1:
+                output.append(f"[{''.join(sorted(set(chord)))}]")
             else:
-                return False, str(e)
-    return False, "Превышено число попыток"
+                output.append(chord[0])
+    
+    def _process_for_minecraft(self, midi_file, events):
+        """Обработка для Minecraft 1.21.9 нотных блоков"""
+        notes = []
+        current_time = 0
+        
+        for msg in midi_file:
+            current_time += msg.time
+            if hasattr(msg, 'type') and msg.type == 'note_on' and hasattr(msg, 'velocity') and msg.velocity > 0:
+                # Фильтрация только нот в диапазоне нотных блоков (C2-A3 = 36-57)
+                if 36 <= msg.note <= 57:
+                    notes.append((current_time, msg.note, msg.velocity))
+        
+        commands = []
+        x, y, z = 0, 0, 0
+        
+        for i, (time, note, vel) in enumerate(notes[:50]):  # Ограничение для демо
+            # Конвертация MIDI ноты в индекс нотного блока (0-24)
+            block_note = max(0, min(24, note - 36))
+            
+            # Команда для установки нотного блока с правильной нотой
+            command = (
+                f"/setblock ~{x+i} ~{y} ~{z} minecraft:note_block{{"
+                f"note:{block_note},powered:1b,"
+                f"instrument:{self._get_mc_instrument(vel)}}}"
+            )
+            commands.append(command)
+        
+        return "\n".join(commands)
+    
+    def _process_for_roblox(self, midi_file, events):
+        """Обработка для Roblox Piano"""
+        notes = []
+        current_time = 0
+        
+        for msg in midi_file:
+            current_time += msg.time
+            if hasattr(msg, 'type') and msg.type == 'note_on' and hasattr(msg, 'velocity') and msg.velocity > 0:
+                # Все ноты для Roblox, но с нормализацией громкости
+                normalized_vel = max(1, min(127, msg.velocity))
+                notes.append((current_time, msg.note, normalized_vel))
+        
+        # Генерация Lua скрипта
+        lua_script = """-- Roblox Piano Script generated by AstraConv v0.0.6
+local piano = workspace.Piano -- Измените путь к вашему пианино
+local notes = {\n"""
+        
+        for time, note, vel in notes[:30]:  # Ограничение для демо
+            note_name = self._midi_to_note(note).replace('#', 's')
+            key_name = f"Key_{note_name}"
+            lua_script += f"    {{time = {time:.2f}, key = '{key_name}', velocity = {vel}}},\n"
+        
+        lua_script += """}
 
+local function playNote(noteData)
+    local key = piano:FindFirstChild(noteData.key)
+    if key then
+        key.Transparency = 0.5
+        game:GetService("Debris"):AddItem(key, 0.2)
+        
+        -- Здесь должна быть логика нажатия клавиши
+        print("Playing note:", noteData.key, "at velocity", noteData.velocity)
+    end
+end
 
-def perform_replacement_and_restart(new_file, target_name, is_frozen):
-    """
-    Заменяет текущий exe на скачанный и перезапускает.
-    На Windows создаётся .bat, который ждёт завершения процесса,
-    подменяет файл и запускает заново.
-    """
-    try:
-        if is_frozen or (sys.argv and sys.argv[0].lower().endswith(".exe")):
-            current = os.path.basename(sys.argv[0])
-            backup = current + ".bak"
-            bat_path = os.path.join(tempfile.gettempdir(), "astraconv_update.bat")
-            bat = f"""@echo off
-setlocal
-:waitloop
-taskkill /f /im "{current}" >nul 2>&1
-timeout /t 1 /nobreak >nul
-tasklist /fi "IMAGENAME eq {current}" 2>nul | findstr /i "{current}" >nul && goto waitloop
-timeout /t 1 /nobreak >nul
-if exist "{backup}" del /f /q "{backup}" >nul 2>&1
-if exist "{current}" move /y "{current}" "{backup}" >nul 2>&1
-if exist "{new_file}" move /y "{new_file}" "{target_name}" >nul 2>&1
-if exist "{target_name}" (
-    start "" "{target_name}"
-    del /f /q "{backup}" >nul 2>&1
-) else (
-    if exist "{backup}" (
-        move /y "{backup}" "{current}" >nul 2>&1
-        start "" "{current}"
-    )
-)
-del /f /q "%~f0" >nul 2>&1 & exit
+local startTime = os.clock()
+for _, noteData in ipairs(notes) do
+    local waitTime = noteData.time - (os.clock() - startTime)
+    if waitTime > 0 then wait(waitTime) end
+    playNote(noteData)
+end
 """
-            with open(bat_path, "w", encoding="utf-8") as f:
-                f.write(bat)
-            subprocess.Popen(["cmd", "/c", "start", "", bat_path],
-                             shell=False, close_fds=True)
-            sys.exit(0)
+        return lua_script
+    
+    def _process_for_terraria(self, midi_file, events):
+        """Обработка для Terraria музыкальной шкатулки"""
+        notes = []
+        current_time = 0
+        
+        try:
+            import mido
+        except ImportError:
+            return "Ошибка: не установлен модуль mido. Пожалуйста, установите его командой: pip install mido"
+        
+        # Получаем ticks_per_beat из файла MIDI
+        ticks_per_beat = midi_file.ticks_per_beat if hasattr(midi_file, 'ticks_per_beat') else 480
+        tempo = 500000  # microseconds per beat (default)
+        
+        for msg in midi_file:
+            if hasattr(msg, 'type') and msg.type == 'set_tempo':
+                tempo = msg.tempo
+            
+            current_time += mido.tick2second(msg.time, ticks_per_beat, tempo) if hasattr(mido, 'tick2second') else msg.time / 1000.0
+            
+            if hasattr(msg, 'type') and msg.type == 'note_on' and hasattr(msg, 'velocity') and msg.velocity > 0:
+                # Terraria поддерживает только основные ноты без аккордов
+                if 48 <= msg.note <= 72:  # C3-C5
+                    beat = int(current_time * 4)  # 4 beats per second
+                    notes.append((beat, msg.note))
+        
+        # Формат Terraria Music Box: номер_бита:нота
+        terraria_format = ""
+        last_beat = -1
+        
+        for beat, note in notes[:20]:  # Ограничение для демо
+            if beat != last_beat:
+                terraria_format += f"\n{beat}: "
+                last_beat = beat
+            terraria_format += f"{self._midi_to_note(note)} "
+        
+        return f"# Terraria Music Box Data (AstraConv v0.0.6)\n{terraria_format}"
+    
+    def _midi_to_note(self, midi_num):
+        """Конвертация MIDI номера в название ноты"""
+        notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        octave = (midi_num // 12) - 1
+        note = notes[midi_num % 12]
+        return f"{note}{octave}"
+    
+    def _get_mc_instrument(self, velocity):
+        """Определение инструмента для Minecraft на основе громкости"""
+        if velocity < 40:
+            return "harp"  # Арфа
+        elif velocity < 80:
+            return "basedrum"  # Бас-барабан
         else:
-            target = os.path.abspath(sys.argv[0]) if sys.argv else None
-            if target and target.endswith(".py"):
-                try:
-                    os.replace(new_file, target)
-                except Exception as e:
-                    raise RuntimeError(f"Не удалось заменить файл: {e}")
-                os.execv(sys.executable, [sys.executable, target])
-            else:
-                raise RuntimeError("Не удалось определить путь для замены")
-    except Exception as e:
-        raise RuntimeError(f"Ошибка замены: {e}")
+            return "pling"  # Пианино (pling)
 
-
-def load_local_settings() -> dict:
-    try:
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-    except Exception:
-        pass
-    return {}
-
-
-def save_local_settings(s: dict):
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                              ТЕМА
-# ═══════════════════════════════════════════════════════════════════
-
-class Theme:
-    BG       = "#0a0a0a"
-    SURFACE  = "#141414"
-    SURFACE2 = "#1e1e1e"
-    BORDER   = "#2e2a1a"
-    TEXT     = "#f5e6b8"
-    MUTED    = "#8a7a4a"
-    ACCENT   = "#d4af37"
-    ACCENT2  = "#f0c75e"
-    SUCCESS  = "#7dd87d"
-    ERROR    = "#ff5c5c"
-    WARNING  = "#e6b800"
-    SELECT   = "#3a2f10"
-
-
-AUDIO_EXTS = {'.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.opus'}
-MIDI_EXTS  = {'.mid', '.midi'}
-
-TRANSCRIBE_LOG = os.path.join(tempfile.gettempdir(), "astraconv_transcribe.log")
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                    КОНФИГ FREEPIANO (88 клавиш)
-# ═══════════════════════════════════════════════════════════════════
-
-CONFIG_TEXT = """
-GroupCount	2
-Group	Set	0
-KeySignature	Set	0
-Velocity	In_0	Set	80
-Velocity	In_1	Set	100
-Sustain	Out_0	Set	127
-Keydown	F5	Record
-Keydown	1	Note	In_0	C2
-Label	1	1
-Keydown	2	Note	In_0	D2
-Label	2	2
-Keydown	3	Note	In_0	E2
-Label	3	3
-Keydown	4	Note	In_0	F2
-Label	4	4
-Keydown	5	Note	In_0	G2
-Label	5	5
-Keydown	6	Note	In_0	A2
-Label	6	6
-Keydown	7	Note	In_0	B2
-Label	7	7
-Keydown	8	Note	In_0	C3
-Label	8	8
-Keydown	9	Note	In_0	D3
-Label	9	9
-Keydown	0	Note	In_0	E3
-Label	0	0
-Keydown	Q	Note	In_0	F3
-Label	Q	Q
-Keydown	W	Note	In_0	G3
-Label	W	W
-Keydown	E	Note	In_0	A3
-Label	E	E
-Keydown	R	Note	In_0	B3
-Label	R	R
-Keydown	T	Note	In_0	C4
-Label	T	T
-Keydown	Y	Note	In_0	D4
-Label	Y	Y
-Keydown	U	Note	In_0	E4
-Label	U	U
-Keydown	I	Note	In_0	F4
-Label	I	I
-Keydown	O	Note	In_0	G4
-Label	O	O
-Keydown	P	Note	In_0	A4
-Label	P	P
-Keydown	A	Note	In_0	B4
-Label	A	A
-Keydown	S	Note	In_0	C5
-Label	S	S
-Keydown	D	Note	In_0	D5
-Label	D	D
-Keydown	F	Note	In_0	E5
-Label	F	F
-Keydown	G	Note	In_0	F5
-Label	G	G
-Keydown	H	Note	In_0	G5
-Label	H	H
-Keydown	J	Note	In_0	A5
-Label	J	J
-Keydown	K	Note	In_0	B5
-Label	K	K
-Keydown	L	Note	In_0	C6
-Label	L	L
-Keydown	Z	Note	In_0	D6
-Label	Z	Z
-Keydown	X	Note	In_0	E6
-Label	X	X
-Keydown	C	Note	In_0	F6
-Label	C	C
-Keydown	V	Note	In_0	G6
-Label	V	V
-Keydown	B	Note	In_0	A6
-Label	B	B
-Keydown	N	Note	In_0	B6
-Label	N	N
-Keydown	M	Note	In_0	C7
-Label	M	M
-Keydown	"	Sustain	In_1	Flip	127
-Keydown	Space	Sustain	In_1	Flip	127
-Keyup	Space	Sustain	In_1	Flip	127
-Label	Space	VP
-Keydown	Ctrl	Group	Set	1
-Keyup	Ctrl	Group	Set	0
-Keydown	Up	Transpose	In_0	Inc	1
-Keydown	Down	Transpose	In_0	Dec	1
-Group	Set	1
-KeySignature	Set	0
-Velocity	In_0	Set	80
-Velocity	In_1	Set	100
-Keydown	1	Note	In_0	C#2
-Label	1	1#
-Keydown	2	Note	In_0	D#2
-Label	2	2#
-Keydown	3	Note	In_0	F#2
-Label	3	4#
-Keydown	4	Note	In_0	G#2
-Label	4	5#
-Keydown	5	Note	In_0	A#2
-Label	5	6#
-Keydown	6	Note	In_0	C#3
-Label	6	8#
-Keydown	7	Note	In_0	D#3
-Label	7	9#
-Keydown	8	Note	In_0	F#3
-Label	8	Q#
-Keydown	9	Note	In_0	G#3
-Label	9	W#
-Keydown	0	Note	In_0	A#3
-Label	0	E#
-Keydown	Q	Note	In_0	C#4
-Label	Q	T#
-Keydown	W	Note	In_0	D#4
-Label	W	Y#
-Keydown	E	Note	In_0	F#4
-Label	E	I#
-Keydown	R	Note	In_0	G#4
-Label	R	O#
-Keydown	T	Note	In_0	A#4
-Label	T	P#
-Keydown	Y	Note	In_0	C#5
-Label	Y	S#
-Keydown	U	Note	In_0	D#5
-Label	U	D5#
-Keydown	I	Note	In_0	F#5
-Label	I	G5#
-Keydown	O	Note	In_0	G#5
-Label	O	H#
-Keydown	P	Note	In_0	A#5
-Label	P	J#
-Keydown	A	Note	In_0	C#6
-Label	A	L#
-Keydown	S	Note	In_0	D#6
-Label	S	Z#
-Keydown	D	Note	In_0	F#6
-Label	D	X#
-Keydown	F	Note	In_0	G#6
-Label	F	C6#
-Keydown	G	Note	In_0	A#6
-Label	G	V#
-Keydown	H	Note	In_0	C#7
-Label	H	N#
-Keydown	J	Note	In_0	D#7
-Label	J	M#
-Keydown	K	Note	In_0	F#7
-Label	K	B#
-Keydown	L	Note	In_0	G#7
-Label	L	C8
-"""
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                          MIDI-ЛОГИКА
-# ═══════════════════════════════════════════════════════════════════
-
-@dataclass
-class KeyMap:
-    note: int
-    key: str
-    group: int
-
-
-@dataclass
-class NoteEvent:
-    midi: int
-    start_tick: int
-    end_tick: int
-    velocity: int
-    shift: int = 0
-    original_midi: int = 0
-
-
-@dataclass
-class ChordData:
-    notes: List[NoteEvent]
-    key_tokens: List[str]
-    index: int = 0
-    is_break: bool = False
-    comment: str = ""
-    is_comment: bool = False
-
-
-def note_to_midi(note: str) -> Optional[int]:
-    notes = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
-    if not note or note[0] not in notes:
-        return None
-    base = notes[note[0]]
-    idx = 1
-    sharp = 0
-    if len(note) > 1 and note[1] == '#':
-        sharp = 1
-        idx = 2
-    try:
-        octave = int(note[idx:])
-    except ValueError:
-        return None
-    return (octave + 1) * 12 + base + sharp
-
-
-def parse_freepiano_config(config_text: str) -> List[KeyMap]:
-    mappings = []
-    current_group = 0
-    skip_keys = {'Ctrl', 'Shift', 'RShift', 'Space', '"',
-                 'Up', 'Down', 'F5', 'Tab', 'Esc'}
-    for line in config_text.strip().split('\n'):
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        parts = line.split('\t')
-        if len(parts) >= 3 and parts[0] == 'Group' and parts[1] == 'Set':
-            current_group = int(parts[2])
-            continue
-        if (len(parts) >= 5 and parts[0] == 'Keydown'
-                and parts[2] == 'Note'):
-            key_name = parts[1]
-            note_name = parts[4]
-            if key_name in skip_keys:
-                continue
-            midi_note = note_to_midi(note_name)
-            if midi_note is None:
-                continue
-            mappings.append(KeyMap(note=midi_note, key=key_name,
-                                   group=current_group))
-    return mappings
-
-
-def build_maps(mappings: List[KeyMap]) -> Tuple[Dict[int, str], Set[int]]:
-    note_to_key: Dict[int, str] = {}
-    ctrl_notes: Set[int] = set()
-    for m in mappings:
-        if m.group == 0:
-            note_to_key[m.note] = m.key
-        else:
-            ctrl_notes.add(m.note)
-    return note_to_key, ctrl_notes
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                    basic-pitch (MP3 → MIDI)
-# ═══════════════════════════════════════════════════════════════════
-
-def _find_working_model() -> Optional[str]:
-    try:
-        from basic_pitch import ICASSP_2022_MODEL_PATH
-    except Exception:
-        return None
-    base = Path(str(ICASSP_2022_MODEL_PATH))
-    candidates = [
-        base.with_suffix(base.suffix + ".onnx") if base.suffix != ".onnx"
-        else base,
-        Path(str(base) + ".onnx"),
-        base,
-        Path(str(base) + ".tflite"),
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            from basic_pitch.inference import Model
-            Model(str(path))
-            return str(path)
-        except Exception:
-            continue
-    return None
-
-
-def _write_log(lines):
-    try:
-        with open(TRANSCRIBE_LOG, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-    except Exception:
-        pass
-
-
-def transcribe_audio_to_midi(audio_path: str,
-                             onset_threshold: float = 0.5,
-                             frame_threshold: float = 0.3,
-                             min_note_ms: float = 80.0,
-                             post_min_note_ms: float = 40.0,
-                             merge_gap_ms: float = 15.0) -> str:
-    log = ["=== AstraConv / basic-pitch ==="]
-    log.append(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    log.append(f"File: {audio_path}")
-
-    try:
-        size = os.path.getsize(audio_path)
-    except OSError as e:
-        raise RuntimeError(f"Не удаётся прочитать файл: {e}")
-    if size < 1024:
-        raise RuntimeError(f"Файл слишком мал ({size} байт)")
-
-    import_log = io.StringIO()
-    prev = logging.root.manager.disable
-    logging.disable(logging.CRITICAL)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with contextlib.redirect_stdout(import_log), \
-                    contextlib.redirect_stderr(import_log):
-                from basic_pitch.inference import predict
-    except ImportError as e:
-        logging.disable(prev)
-        raise RuntimeError(f"basic-pitch не установлен: {e}")
-
-    model_path = _find_working_model()
-    if not model_path:
-        logging.disable(prev)
-        raise RuntimeError(
-            "Не найдена рабочая модель basic-pitch.\n"
-            "Установите: pip install --force-reinstall basic-pitch[onnx]")
-
-    log.append(f"Model: {model_path}")
-    captured = io.StringIO()
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with contextlib.redirect_stdout(captured), \
-                    contextlib.redirect_stderr(captured):
-                _, midi_data, note_events = predict(
-                    audio_path, model_or_model_path=model_path,
-                    onset_threshold=onset_threshold,
-                    frame_threshold=frame_threshold,
-                    minimum_note_length=min_note_ms)
-    except BaseException as e:
-        logging.disable(prev)
-        log.append(captured.getvalue())
-        log.append(f"EXCEPTION: {type(e).__name__}: {e}")
-        log.append(traceback.format_exc())
-        _write_log(log)
-        raise RuntimeError(f"Транскрипция не удалась: {e}")
-
-    logging.disable(prev)
-    if midi_data is None:
-        raise RuntimeError("basic-pitch не вернул MIDI")
-
-    min_sec, merge_sec = post_min_note_ms / 1000, merge_gap_ms / 1000
-    for inst in midi_data.instruments:
-        notes = [n for n in inst.notes if (n.end - n.start) >= min_sec]
-        notes.sort(key=lambda n: (n.pitch, n.start))
-        merged = []
-        for n in notes:
-            if merged and merged[-1].pitch == n.pitch and \
-                    (n.start - merged[-1].end) <= merge_sec:
-                if n.end > merged[-1].end:
-                    merged[-1].end = n.end
-                if n.velocity > merged[-1].velocity:
-                    merged[-1].velocity = n.velocity
-            else:
-                merged.append(n)
-        inst.notes = merged
-
-    out_path = os.path.join(tempfile.gettempdir(),
-                            f"astraconv_{os.getpid()}_{int(time.time()*1000)}.mid")
-    midi_data.write(out_path)
-    _write_log(log)
-    return out_path
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                          ПАРСИНГ MIDI
-# ═══════════════════════════════════════════════════════════════════
-
-def load_midi_events(path: str) -> dict:
-    if mido is None:
-        raise RuntimeError("Библиотека mido не установлена")
-    mid = mido.MidiFile(path)
-    tpb = mid.ticks_per_beat or 480
-
-    tracks_info = []
-    for i, tr in enumerate(mid.tracks):
-        name = tr.name if tr.name else f"Track {i+1}"
-        notes = sum(1 for m in tr
-                    if m.type == 'note_on' and m.velocity > 0)
-        tracks_info.append({'index': i, 'name': name, 'notes': notes,
-                            'selected': True})
-
-    merged = mido.merge_tracks(mid.tracks)
-    tempo_changes = []
-    events = []
-    tick = 0
-    for msg in merged:
-        tick += msg.time
-        if msg.type == 'set_tempo':
-            tempo_changes.append((tick, msg.tempo))
-        elif msg.type == 'note_on' and msg.velocity > 0:
-            events.append((tick, 1, msg.note, msg.velocity))
-        elif msg.type == 'note_off' or \
-                (msg.type == 'note_on' and msg.velocity == 0):
-            events.append((tick, 0, msg.note, 0))
-    events.sort(key=lambda e: (e[0], e[1]))
-
-    return {
-        'ticks_per_beat': tpb,
-        'tempo_changes': tempo_changes,
-        'events': events,
-        'total_ticks': tick,
-        'tracks_info': tracks_info,
-        'path': path,
-    }
-
-
-def compute_timing(data: dict) -> Tuple[float, float]:
-    tpb = data['ticks_per_beat']
-    last_tick = data['total_ticks']
-    if last_tick <= 0:
-        return 120.0, 1.0
-
-    total_ms = 0.0
-    prev_tick, prev_tempo = 0, 500000
-    for t, tempo in data['tempo_changes']:
-        total_ms += ((t - prev_tick) / tpb) * (prev_tempo / 1000.0)
-        prev_tick, prev_tempo = t, tempo
-    total_ms += ((last_tick - prev_tick) / tpb) * (prev_tempo / 1000.0)
-
-    total_beats = last_tick / tpb
-    total_sec = total_ms / 1000.0
-    bpm = (total_beats / total_sec * 60.0) if total_sec > 0 else 120.0
-    ms_per_tick = total_ms / last_tick if last_tick > 0 else 1.0
-    return bpm, ms_per_tick
-
-
-def bpm_to_density(bpm: float) -> int:
-    if bpm <= 0:
-        return 2
-    return max(0, min(8, round((200.0 - bpm) / 20.0)))
-
-
-def best_transposition(notes: List[NoteEvent],
-                       note_to_key: Dict[int, str],
-                       ctrl_notes: Set[int]) -> int:
-    best_shift = 0
-    best_score = -1
-    all_keys = set(note_to_key.keys()) | ctrl_notes
-    for shift in range(-11, 12):
-        score = 0
-        for n in notes:
-            candidate = n.original_midi + shift
-            if candidate in all_keys:
-                score += 1
-            if candidate in note_to_key:
-                score += 0.5
-        if score > best_score:
-            best_score = score
-            best_shift = shift
-    return best_shift
-
-
-QUANTIZE_STEPS = {
-    "off":  None,
-    "1/4":  1.0,
-    "1/8":  0.5,
-    "1/16": 0.25,
-    "1/32": 0.125,
-}
-
-
-def quantize_events(events: List[NoteEvent], tpb: int,
-                    quantize: str) -> List[NoteEvent]:
-    step_beats = QUANTIZE_STEPS.get(quantize)
-    if step_beats is None:
-        return events
-    step_ticks = max(1, int(round(step_beats * tpb)))
-    for n in events:
-        n.start_tick = int(round(n.start_tick / step_ticks)) * step_ticks
-        n.end_tick = int(round(n.end_tick / step_ticks)) * step_ticks
-        if n.end_tick <= n.start_tick:
-            n.end_tick = n.start_tick + step_ticks
-    return events
-
-
-def events_to_note_list(data: dict) -> List[NoteEvent]:
-    active: Dict[int, Tuple[int, int]] = {}
-    result: List[NoteEvent] = []
-    for tick, kind, note, vel in data['events']:
-        if kind == 1:
-            active[note] = (tick, vel)
-        else:
-            if note in active:
-                s, v = active.pop(note)
-                result.append(NoteEvent(midi=note, start_tick=s, end_tick=tick,
-                                        velocity=v, original_midi=note))
-    last_tick = data['total_ticks']
-    for note, (s, v) in active.items():
-        result.append(NoteEvent(midi=note, start_tick=s, end_tick=last_tick,
-                                velocity=v, original_midi=note))
-    result.sort(key=lambda e: (e.start_tick, e.end_tick))
-    return result
-
-
-def group_into_chords(notes: List[NoteEvent],
-                      note_to_key: Dict[int, str],
-                      ctrl_notes: Set[int],
-                      window_ms: float, ms_per_tick: float,
-                      velocity_threshold: int,
-                      auto_transpose: bool) -> List[ChordData]:
-    tolerance_ticks = (max(0, int(round(window_ms / ms_per_tick)))
-                       if ms_per_tick > 0 else 0)
-    chords: List[ChordData] = []
-    current: List[NoteEvent] = []
-    current_end = -1
-
-    def flush():
-        nonlocal current, current_end
-        if not current:
-            return
-        if auto_transpose:
-            shift = best_transposition(current, note_to_key, ctrl_notes)
-            for n in current:
-                n.shift = shift
-        tokens: List[str] = []
-        for n in current:
-            work = n.original_midi + n.shift
-            if work in ctrl_notes:
-                continue
-            if work not in note_to_key:
-                continue
-            key = note_to_key[work]
-            if n.shift != 0:
-                key = key + "'"
-            if key not in tokens:
-                tokens.append(key)
-        if tokens:
-            chords.append(ChordData(notes=list(current),
-                                    key_tokens=tokens))
-        current = []
-        current_end = -1
-
-    for n in notes:
-        if n.velocity < velocity_threshold:
-            continue
-        if not current:
-            current.append(n)
-            current_end = n.end_tick
-            continue
-        last_start = current[-1].start_tick
-        if (n.start_tick - last_start) > tolerance_ticks \
-                or n.start_tick > current_end:
-            flush()
-        current.append(n)
-        current_end = max(current_end, n.end_tick)
-    flush()
-    return chords
-
-
-def insert_breaks_realistic(chords: List[ChordData], data: dict
-                            ) -> List[ChordData]:
-    tpb = data['ticks_per_beat']
-    bar_ticks = tpb * 4
-    result: List[ChordData] = []
-    last_bar = -1
-    for ch in chords:
-        if not ch.notes:
-            result.append(ch)
-            continue
-        bar = ch.notes[0].start_tick // bar_ticks
-        if last_bar >= 0 and bar > last_bar:
-            result.append(ChordData(notes=[], key_tokens=[], is_break=True))
-        last_bar = bar
-        result.append(ch)
-    return result
-
-
-def inject_transpose_markers(chords: List[ChordData]) -> List[ChordData]:
-    result: List[ChordData] = []
-    prev_shift: Optional[int] = None
-    for ch in chords:
-        if ch.is_break or not ch.notes:
-            result.append(ch)
-            continue
-        cur_shift = ch.notes[0].shift if ch.notes else 0
-        if prev_shift is None or cur_shift != prev_shift:
-            text = f"Transpose by: {-cur_shift:+d}"
-            result.append(ChordData(notes=[], key_tokens=[],
-                                    is_comment=True, comment=text))
-            prev_shift = cur_shift
-        result.append(ch)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                          ВИДЖЕТ КНОПКИ
-# ═══════════════════════════════════════════════════════════════════
-
-class StyledButton(tk.Frame):
-    def __init__(self, parent, text, command, small=False):
-        super().__init__(parent, bg=Theme.SURFACE2, cursor="arrow")
-        self.command = command
-        self.enabled = False
-        self._bg_normal = Theme.SURFACE2
-        self._bg_hover = Theme.ACCENT
-        self._bg_disabled = Theme.SURFACE
-        self._fg_normal = Theme.ACCENT
-        self._fg_disabled = Theme.MUTED
-        self._fg_hover = "#0a0a0a"
-
-        pad_y = 6 if small else 11
-        font_size = 9 if small else 10
-        self.label = tk.Label(
-            self, text=text, font=("Segoe UI", font_size, "bold"),
-            bg=self._bg_normal, fg=self._fg_normal, padx=8, pady=pad_y)
-        self.label.pack(fill="both", expand=True)
-
-        for w in (self, self.label):
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
-            w.bind("<Button-1>", self._on_click)
-        self.set_enabled(False)
-
-    def _on_enter(self, _):
-        if self.enabled:
-            self.configure(bg=self._bg_hover)
-            self.label.configure(bg=self._bg_hover, fg=self._fg_hover)
-
-    def _on_leave(self, _):
-        if self.enabled:
-            self.configure(bg=self._bg_normal)
-            self.label.configure(bg=self._bg_normal, fg=self._fg_normal)
-
-    def _on_click(self, _):
-        if self.enabled and self.command:
-            self.command()
-
-    def set_enabled(self, enabled):
-        self.enabled = enabled
-        bg = self._bg_normal if enabled else self._bg_disabled
-        fg = self._fg_normal if enabled else self._fg_disabled
-        self.configure(bg=bg, cursor="hand2" if enabled else "arrow")
-        self.label.configure(bg=bg, fg=fg)
-
-    def set_text(self, text):
-        self.label.configure(text=text)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                       UPDATE DIALOG (tkinter)
-# ═══════════════════════════════════════════════════════════════════
-
-class UpdateDialog(tk.Toplevel):
-    def __init__(self, parent, silent=False):
-        super().__init__(parent)
-        self.silent = silent
-        self.title("Обновление AstraConv")
-        self.configure(bg=Theme.BG)
-        self.transient(parent)
-        self.resizable(False, False)
-        self.geometry("520x300")
-        self.grab_set()
-        self._after_id = None
-        self._finished = False
-
-        tk.Label(self, text="✦  Проверка обновлений",
-                 font=("Segoe UI", 14, "bold"),
-                 bg=Theme.BG, fg=Theme.ACCENT).pack(pady=(20, 6))
-
-        self.status_lbl = tk.Label(
-            self, text="Соединение с GitHub...",
-            font=("Segoe UI", 10), bg=Theme.BG, fg=Theme.TEXT,
-            wraplength=460, justify="center")
-        self.status_lbl.pack(pady=(0, 10))
-
-        self.version_lbl = tk.Label(
-            self, text=f"Текущая версия: {CURRENT_VERSION}",
-            font=("Consolas", 9), bg=Theme.BG, fg=Theme.MUTED)
-        self.version_lbl.pack()
-
-        self.progress = ttk.Progressbar(
-            self, orient="horizontal", mode="determinate",
-            style="Gold.Horizontal.TProgressbar", length=440)
-        # спрячем прогресс до момента скачивания
-        self._progress_packed = False
-
-        btn_row = tk.Frame(self, bg=Theme.BG)
-        btn_row.pack(side="bottom", fill="x", padx=20, pady=18)
-
-        self.close_btn = StyledButton(btn_row, "Закрыть", self._on_close)
-        self.close_btn.pack(side="right", fill="x", expand=True, padx=(6, 0))
-        self.close_btn.set_enabled(True)
-
-        self.retry_btn = StyledButton(btn_row, "Проверить снова",
-                                       self._check_async)
-        self.retry_btn.pack(side="right", fill="x", expand=True, padx=(0, 6))
-        self.retry_btn.set_enabled(False)
-
-        self._check_async()
-
-    def _on_close(self):
-        self._finished = True
-        try:
-            self.grab_release()
-        except Exception:
-            pass
-        self.destroy()
-
-    def _set_status(self, text, color=Theme.TEXT):
-        try:
-            self.status_lbl.config(text=text, fg=color)
-        except Exception:
-            pass
-
-    def _show_progress(self, show):
-        if show and not self._progress_packed:
-            self.progress.pack(pady=(0, 10))
-            self._progress_packed = True
-        elif not show and self._progress_packed:
-            self.progress.pack_forget()
-            self._progress_packed = False
-
-    def _check_async(self):
-        self.retry_btn.set_enabled(False)
-        self._set_status("Соединение с GitHub...", Theme.MUTED)
-        self._show_progress(False)
-        self.progress['value'] = 0
-        threading.Thread(target=self._check_worker, daemon=True).start()
-
-    def _check_worker(self):
-        info, err = fetch_latest_release_info()
-        self.after(0, lambda: self._on_check_result(info, err))
-
-    def _on_check_result(self, info, err):
-        if self._finished:
-            return
-        if err or not info:
-            self._set_status(f"Ошибка: {err}", Theme.ERROR)
-            self.retry_btn.set_enabled(True)
-            return
-
-        tag = (info.get("tag_name") or info.get("name") or "").strip()
-        latest = tag.lstrip("v").strip()
-        if not latest:
-            self._set_status("Не удалось определить версию из релиза",
-                             Theme.WARNING)
-            self.retry_btn.set_enabled(True)
-            return
-
-        self.version_lbl.config(
-            text=f"Текущая: {CURRENT_VERSION}   ·   На GitHub: {latest}")
-
-        if version_tuple(latest) <= version_tuple(CURRENT_VERSION):
-            self._set_status("✓  Установлена последняя версия",
-                             Theme.SUCCESS)
-            if self.silent:
-                self.after(1500, self._on_close)
-            return
-
-        asset_url = None
-        asset_size = 0
-        for a in info.get("assets", []) or []:
-            if a.get("name") == ASSET_NAME:
-                asset_url = a.get("browser_download_url")
-                asset_size = a.get("size", 0)
-                break
-
-        if not asset_url:
-            self._set_status(
-                f"В релизе {latest} нет файла {ASSET_NAME}\n"
-                "Проверьте настройки репозитория.", Theme.WARNING)
-            self.retry_btn.set_enabled(True)
-            return
-
-        # Спрашиваем у пользователя
-        size_mb = asset_size / 1024 / 1024 if asset_size else 0
-        msg = (f"Доступна новая версия: {latest}\n"
-               f"Текущая: {CURRENT_VERSION}\n")
-        if size_mb:
-            msg += f"Размер: {size_mb:.1f} МБ\n"
-        msg += "\nСкачать и установить сейчас?"
-
-        if self.silent:
-            # в тихом режиме не спрашиваем
-            ans = messagebox.askyesno("Обновление AstraConv", msg, parent=self)
-        else:
-            ans = messagebox.askyesno("Обновление AstraConv", msg, parent=self)
-
-        if not ans:
-            self._set_status("Обновление отложено", Theme.MUTED)
-            self.retry_btn.set_enabled(True)
-            return
-
-        self._set_status("Скачивание...", Theme.WARNING)
-        self._show_progress(True)
-        threading.Thread(
-            target=self._download_worker,
-            args=(asset_url,),
-            daemon=True).start()
-
-    def _download_worker(self, url):
-        tmp = os.path.join(tempfile.gettempdir(),
-                            f"AstraConv_update_{int(time.time())}.exe")
-
-        def progress(pct):
-            self.after(0, lambda: self._set_progress(pct))
-
-        ok, err = download_asset_to_file(url, tmp, progress_callback=progress)
-        self.after(0, lambda: self._on_download_done(ok, err, tmp))
-
-    def _set_progress(self, pct):
-        try:
-            self.progress['value'] = pct
-        except Exception:
-            pass
-
-    def _on_download_done(self, ok, err, tmp):
-        if self._finished:
-            return
-        if not ok:
-            self._set_status(f"Ошибка загрузки: {err}", Theme.ERROR)
-            self._show_progress(False)
-            self.retry_btn.set_enabled(True)
-            return
-
-        self._set_status("Установка и перезапуск...", Theme.SUCCESS)
-        self._set_progress(100)
-
-        is_frozen = getattr(sys, "frozen", False) or \
-            (sys.argv and sys.argv[0].lower().endswith(".exe"))
-
-        try:
-            perform_replacement_and_restart(tmp, ASSET_NAME, is_frozen)
-        except Exception as e:
-            self._set_status(f"Не удалось установить: {e}", Theme.ERROR)
-            self._show_progress(False)
-            self.retry_btn.set_enabled(True)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                  ДИАЛОГ ВЫБОРА ТРЕКОВ
-# ═══════════════════════════════════════════════════════════════════
-
-class TrackDialog(tk.Toplevel):
-    def __init__(self, parent, tracks_info):
-        super().__init__(parent)
-        self.title("Выбор треков")
-        self.configure(bg=Theme.BG)
-        self.transient(parent)
-        self.grab_set()
-        self.geometry("440x400")
-        self.result = None
-
-        tk.Label(self, text="✦  Какие треки конвертировать",
-                 font=("Segoe UI", 12, "bold"),
-                 bg=Theme.BG, fg=Theme.ACCENT).pack(pady=(14, 10))
-
-        wrap = tk.Frame(self, bg=Theme.BG)
-        wrap.pack(fill="both", expand=True, padx=20)
-
-        self.vars = []
-        for tr in tracks_info:
-            var = tk.BooleanVar(value=tr.get('selected', True))
-            self.vars.append(var)
-            row = tk.Frame(wrap, bg=Theme.BG)
-            row.pack(fill="x", pady=2)
-            tk.Checkbutton(
-                row, text=f"  {tr['name']}  ({tr['notes']} нот)",
-                variable=var, bg=Theme.BG, fg=Theme.TEXT,
-                activebackground=Theme.BG, activeforeground=Theme.ACCENT,
-                selectcolor=Theme.SURFACE2, font=("Segoe UI", 10),
-                anchor="w", bd=0, highlightthickness=0
-            ).pack(side="left", fill="x", expand=True)
-
-        btns = tk.Frame(self, bg=Theme.BG)
-        btns.pack(fill="x", padx=20, pady=16)
-        ok = StyledButton(btns, "OK", self._ok)
-        ok.pack(side="right", fill="x", expand=True, padx=(6, 0))
-        ok.set_enabled(True)
-        cancel = StyledButton(btns, "Отмена", self.destroy)
-        cancel.pack(side="right", fill="x", expand=True, padx=(0, 6))
-        cancel.set_enabled(True)
-
-        self.wait_window(self)
-
-    def _ok(self):
-        self.result = [v.get() for v in self.vars]
-        self.destroy()
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                ДИАЛОГ РЕДАКТИРОВАНИЯ АККОРДА
-# ═══════════════════════════════════════════════════════════════════
-
-class ChordEditDialog(tk.Toplevel):
-    def __init__(self, parent, chord: ChordData, idx: int):
-        super().__init__(parent)
-        self.title(f"Аккорд #{idx + 1}")
-        self.configure(bg=Theme.BG)
-        self.transient(parent)
-        self.grab_set()
-        self.geometry("440x260")
-        self.result = None
-
-        tk.Label(self, text="Ноты аккорда (через пробел):",
-                 font=("Segoe UI", 10),
-                 bg=Theme.BG, fg=Theme.TEXT).pack(anchor="w", padx=20,
-                                                  pady=(16, 4))
-
-        self.entry = tk.Entry(
-            self, bg=Theme.SURFACE2, fg=Theme.TEXT,
-            insertbackground=Theme.ACCENT,
-            font=("Consolas", 14), bd=0)
-        self.entry.pack(fill="x", padx=20, ipady=8)
-        self.entry.insert(0, " ".join(chord.key_tokens))
-
-        tk.Label(self,
-                 text="Пример: T Y U  или  [T Y U]  — через пробел",
-                 font=("Segoe UI", 8), bg=Theme.BG, fg=Theme.MUTED
-                 ).pack(anchor="w", padx=20, pady=(4, 0))
-
-        btns = tk.Frame(self, bg=Theme.BG)
-        btns.pack(fill="x", padx=20, pady=20)
-        ok = StyledButton(btns, "Сохранить", self._ok)
-        ok.pack(side="right", fill="x", expand=True, padx=(6, 0))
-        ok.set_enabled(True)
-        cancel = StyledButton(btns, "Отмена", self.destroy)
-        cancel.pack(side="right", fill="x", expand=True, padx=(0, 6))
-        cancel.set_enabled(True)
-
-        self.wait_window(self)
-
-    def _ok(self):
-        text = self.entry.get().strip()
-        if text:
-            self.result = text.split()
-        self.destroy()
-
-
-# ═══════════════════════════════════════════════════════════════════
-#                                GUI
-# ═══════════════════════════════════════════════════════════════════
-
-class AstraConvGUI:
-    MAX_UNDO = 50
-
+class AstrConvApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"AstraConv {CURRENT_VERSION} — MIDI/MP3 → QWERTY")
-        self.root.geometry("900x960")
-        self.root.minsize(720, 780)
-        self.root.configure(bg=Theme.BG)
-
-        self.result_text = ""
-        self.code_text = ""
-        self.status_base = "Перетащите .mid или .mp3 файл"
-        self.current_chords: List[ChordData] = []
-        self.current_file_path: Optional[str] = None
-        self.current_is_audio = False
-
-        self._midi_data: Optional[dict] = None
-        self._note_to_key: Dict[int, str] = {}
-        self._ctrl_notes: Set[int] = set()
-        self._raw_notes: List[NoteEvent] = []
-        self._tracks_info: List[dict] = []
-        self._undo_stack: List[List[ChordData]] = []
-
-        self.last_bpm = 120.0
-        self.last_auto_density = 2
-        self.last_auto_window_ms = 0.0
-
-        self._ui_ready = False
-        self._setting_density = False
-
-        # настройки
-        self._settings = load_local_settings()
-
-        self.density_var = tk.IntVar(value=2)
-        self.font_size_var = tk.IntVar(value=15)
-        self.auto_density_var = tk.BooleanVar(value=True)
-        self.velocity_var = tk.IntVar(value=20)
-        self.auto_transpose_var = tk.BooleanVar(value=False)
-        self.quantize_var = tk.StringVar(value="off")
-        self.breaks_var = tk.StringVar(value="realistic")
-        self.show_markers_var = tk.BooleanVar(value=True)
-        self.auto_update_var = tk.BooleanVar(
-            value=bool(self._settings.get("check_updates_on_start", True)))
-
-        self._setup_ttk()
-        self._build_ui()
-        self._setup_shortcuts()
-        self._setup_dnd()
-
-        # авто-проверка обновлений через 2 секунды после старта
-        if self.auto_update_var.get():
-            self.root.after(2000, self._auto_check_updates)
-
-    def _setup_ttk(self):
+        self.root.title("🚀 AstraConv v0.0.6")
+        self.root.geometry("1300x800")
+        self.root.minsize(1100, 700)
+        
+        # Установка темной темы
+        self.setup_styles()
+        
+        # Создание атрибутов
+        self.midi_path = ""
+        self.processing = False
+        self.visualization_active = False
+        self.visualization_thread = None
+        self.copying_in_progress = False
+        self.current_tab = "main"
+        
+        # Настройки по умолчанию
+        self.settings = {
+            'detail_level': 'medium',  # 'high', 'medium', 'low'
+            'animations': True,
+            'wrap_text': False,
+            'chord_threshold': 0.025,
+            'max_notes': 100000,
+            'show_unmapped': True,
+            'space_between_chords': True,
+            'background_enabled': True
+        }
+        
+        # Загрузка сохраненных настроек
+        self.load_settings()
+        
+        # Инициализация аудио-зависимостей
+        self.pygame_available = self.check_pygame()
+        self.fluidsynth_available = self.check_fluidsynth()
+        self.soundfont_path = self.get_soundfont_path()
+        self.soundfont_available = self.soundfont_path and os.path.exists(self.soundfont_path)
+        self.audio_available = self.pygame_available and self.fluidsynth_available and self.soundfont_available
+        
+        # Создание виджетов
+        self.create_widgets()
+        
+        # Горячие клавиши
+        self.root.bind('<Control-m>', lambda e: self.generate_mc_commands())
+        self.root.bind('<Control-r>', lambda e: self.export_roblox_script())
+        self.root.bind('<Control-t>', lambda e: self.export_terraria_music_box())
+        self.root.bind('<Control-o>', lambda e: self.load_midi_file())
+        self.root.bind('<Control-s>', lambda e: self.save_result())
+        self.root.bind('<Control-c>', lambda e: self.copy_result())
+        
+        # Статус-бар
+        self.status_var = tk.StringVar(value="Готов к работе | AstraConv v0.0.6")
+        status_bar = tk.Label(root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, 
+                            anchor=tk.W, bg="#2d2d30", fg="#d4d4d4", font=("Segoe UI", 9))
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Инициализация звездного фона
+        if self.settings.get('background_enabled', True) and self.settings.get('animations', True):
+            self.init_stars()
+    
+    def setup_styles(self):
+        """Настройка современных стилей для интерфейса"""
+        style = ttk.Style()
+        
+        # Используем 'clam' тему как основу для кастомизации
+        style.theme_use('clam')
+        
+        # Темно-серая тема с акцентами
+        bg_color = "#1e1e1e"
+        fg_color = "#d4d4d4"
+        accent_color = "#61afef"
+        secondary_accent = "#c678dd"
+        success_color = "#98c379"
+        warning_color = "#e5c07b"
+        error_color = "#e06c75"
+        
+        # Настройка стилей для ttk виджетов
+        style.configure('TFrame', background=bg_color)
+        style.configure('TLabelframe', background=bg_color, bordercolor="#444", relief=tk.SOLID)
+        style.configure('TLabelframe.Label', background=bg_color, foreground=fg_color, font=("Segoe UI", 10, "bold"))
+        style.configure('TNotebook', background=bg_color, borderwidth=0)
+        style.configure('TNotebook.Tab', 
+                       background="#2d2d30", 
+                       foreground="#a9a9a9",
+                       font=("Segoe UI", 10),
+                       padding=[12, 6])
+        style.map('TNotebook.Tab', 
+                 background=[('selected', bg_color), ('active', '#3a3a3a')],
+                 foreground=[('selected', accent_color), ('active', fg_color)])
+        
+        # Стили для кнопок
+        style.configure('TButton', 
+                       font=("Segoe UI", 10),
+                       background="#2d2d30",
+                       foreground=fg_color,
+                       borderwidth=1,
+                       focusthickness=3,
+                       focuscolor='none')
+        style.map('TButton',
+                 background=[('active', '#3a3a3a'), ('pressed', '#454545')],
+                 foreground=[('active', fg_color), ('pressed', fg_color)])
+        
+        # Стили для кнопок с акцентами
+        style.configure('Accent.TButton',
+                       font=("Segoe UI", 10, "bold"),
+                       background=accent_color,
+                       foreground="#1e1e1e")
+        style.map('Accent.TButton',
+                 background=[('active', '#4da6ff'), ('pressed', '#3d94f5')])
+        
+        # Стили для переключателей
+        style.configure('TCheckbutton',
+                       background=bg_color,
+                       foreground=fg_color,
+                       font=("Segoe UI", 10))
+        style.configure('TRadiobutton',
+                       background=bg_color,
+                       foreground=fg_color,
+                       font=("Segoe UI", 10))
+        
+        # Стили для выпадающих списков
+        style.configure('TMenubutton',
+                       background="#2d2d30",
+                       foreground=fg_color,
+                       font=("Segoe UI", 10))
+        
+        # Корневой фон
+        self.root.configure(bg=bg_color)
+        
+        # Стили для ползунков
+        style.configure('Horizontal.TScale',
+                       background=bg_color,
+                       troughcolor="#3a3a3a",
+                       sliderrelief=tk.FLAT)
+        
+        # Создаем стиль для заголовков
+        self.title_font = ("Segoe UI", 14, "bold")
+        self.subtitle_font = ("Segoe UI", 11)
+        self.normal_font = ("Segoe UI", 10)
+        
+        # Стиль для вкладок
+        style.configure('Custom.TNotebook', background=bg_color, borderwidth=0)
+        style.configure('Custom.TNotebook.Tab', 
+                       background="#2d2d30", 
+                       foreground="#a9a9a9",
+                       font=("Segoe UI", 10),
+                       padding=[12, 6])
+        style.map('Custom.TNotebook.Tab', 
+                 background=[('selected', bg_color), ('active', '#3a3a3a')],
+                 foreground=[('selected', accent_color), ('active', fg_color)])
+    
+    def check_pygame(self):
+        """Проверка доступности pygame"""
         try:
-            style = ttk.Style()
-            if "clam" in style.theme_names():
-                style.theme_use("clam")
-            style.configure("Vertical.TScrollbar", gripcount=0,
-                            background=Theme.SURFACE2,
-                            darkcolor=Theme.SURFACE2,
-                            lightcolor=Theme.SURFACE2,
-                            troughcolor=Theme.SURFACE,
-                            bordercolor=Theme.SURFACE,
-                            arrowcolor=Theme.ACCENT, relief="flat")
-            style.map("Vertical.TScrollbar",
-                      background=[("active", Theme.ACCENT)])
-            style.configure("Gold.Horizontal.TScale",
-                            background=Theme.SURFACE,
-                            troughcolor=Theme.SURFACE2,
-                            darkcolor=Theme.ACCENT,
-                            lightcolor=Theme.ACCENT,
-                            bordercolor=Theme.BORDER)
-            style.configure("Gold.Horizontal.TProgressbar",
-                            background=Theme.ACCENT,
-                            troughcolor=Theme.SURFACE2,
-                            bordercolor=Theme.BORDER,
-                            lightcolor=Theme.ACCENT,
-                            darkcolor=Theme.ACCENT, thickness=4)
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------
-    #  UI
-    # ------------------------------------------------------------
-    def _build_ui(self):
-        # ---------- HEADER ----------
-        header = tk.Frame(self.root, bg=Theme.BG)
-        header.pack(fill="x", padx=26, pady=(16, 4))
-
-        row = tk.Frame(header, bg=Theme.BG)
-        row.pack(fill="x")
-        tk.Label(row, text="AstraConv",
-                 font=("Segoe UI", 22, "bold"),
-                 bg=Theme.BG, fg=Theme.ACCENT).pack(side="left")
-        tk.Label(row, text=f"  ·  v{CURRENT_VERSION}  ·  автор: SMisha2",
-                 font=("Segoe UI", 10),
-                 bg=Theme.BG, fg=Theme.MUTED).pack(side="left", padx=(6, 0))
-
-        # Кнопки справа в шапке
-        self.update_btn = StyledButton(
-            row, "🔄  Обновления",
-            self.open_update_dialog, small=True)
-        self.update_btn.pack(side="right", padx=(4, 0))
-        self.update_btn.set_enabled(True)
-
-        tk.Frame(header, bg=Theme.ACCENT, height=1).pack(fill="x", pady=(6, 6))
-        tk.Label(header,
-                 text="MIDI/MP3 → Freepiano  ·  треки, авто-транспозиция, "
-                      "квантизация, undo, JSON",
-                 font=("Segoe UI", 10), bg=Theme.BG, fg=Theme.MUTED,
-                 anchor="w").pack(anchor="w")
-
-        # ---------- DROP ZONE ----------
-        dz = tk.Frame(self.root, bg=Theme.SURFACE,
-                      highlightbackground=Theme.BORDER,
-                      highlightthickness=1, cursor="hand2")
-        dz.pack(fill="x", padx=26, pady=(12, 8))
-        self.drop_zone = dz
-        icon = tk.Label(dz, text="♛", font=("Segoe UI Symbol", 22),
-                        bg=Theme.SURFACE, fg=Theme.ACCENT)
-        icon.pack(pady=(8, 2))
-        self.drop_icon = icon
-        title = tk.Label(dz, text="Выбрать .mid / .mp3 / .wav",
-                         font=("Segoe UI", 12, "bold"),
-                         bg=Theme.SURFACE, fg=Theme.TEXT)
-        title.pack()
-        self.drop_title = title
-        hint = tk.Label(dz, text="или перетащите файл сюда",
-                        font=("Segoe UI", 9),
-                        bg=Theme.SURFACE, fg=Theme.MUTED)
-        hint.pack(pady=(1, 8))
-        self.drop_hint = hint
-        for w in (dz, icon, title, hint):
-            w.bind("<Button-1>", lambda e: self.select_file())
-            w.bind("<Enter>", self._dz_enter)
-            w.bind("<Leave>", self._dz_leave)
-
-        # ---------- PROGRESS ----------
-        self.progress = ttk.Progressbar(
-            self.root, orient="horizontal", mode="indeterminate",
-            style="Gold.Horizontal.TProgressbar")
-
-        # ---------- SETTINGS ----------
-        settings = tk.Frame(self.root, bg=Theme.SURFACE,
-                            highlightbackground=Theme.BORDER,
-                            highlightthickness=1)
-        settings.pack(fill="x", padx=26, pady=(0, 8))
-
-        tk.Label(settings, text="✦  Настройки",
-                 font=("Segoe UI", 10, "bold"),
-                 bg=Theme.SURFACE, fg=Theme.ACCENT, anchor="w"
-                 ).pack(fill="x", padx=16, pady=(8, 0))
-
-        # Row 1: авто-плотность + BPM
-        r = tk.Frame(settings, bg=Theme.SURFACE)
-        r.pack(fill="x", padx=16, pady=(6, 0))
-        tk.Checkbutton(r, text="  Авто-плотность",
-                       variable=self.auto_density_var,
-                       command=self._on_auto_toggle,
-                       bg=Theme.SURFACE, fg=Theme.TEXT,
-                       activebackground=Theme.SURFACE,
-                       activeforeground=Theme.ACCENT,
-                       selectcolor=Theme.SURFACE2,
-                       font=("Segoe UI", 10), bd=0,
-                       highlightthickness=0, anchor="w").pack(side="left")
-        self.bpm_lbl = tk.Label(r, text="BPM: —",
-                                font=("Consolas", 10, "bold"),
-                                bg=Theme.SURFACE, fg=Theme.MUTED,
-                                anchor="e")
-        self.bpm_lbl.pack(side="right")
-
-        # Row 2: плотность
-        r = tk.Frame(settings, bg=Theme.SURFACE)
-        r.pack(fill="x", padx=16, pady=(4, 2))
-        tk.Label(r, text="Плотность", font=("Segoe UI", 10),
-                 bg=Theme.SURFACE, fg=Theme.TEXT, width=14,
-                 anchor="w").pack(side="left")
-        self.density_value_lbl = tk.Label(r, text="2",
-                                          font=("Consolas", 10, "bold"),
-                                          bg=Theme.SURFACE,
-                                          fg=Theme.ACCENT, width=5)
-        self.density_value_lbl.pack(side="right")
-        self.density_scale = ttk.Scale(r, from_=0, to=12,
-                                       orient="horizontal",
-                                       style="Gold.Horizontal.TScale",
-                                       command=self._on_density_slider)
-        self.density_scale.set(2)
-        self.density_scale.pack(side="left", fill="x", expand=True,
-                                padx=(6, 10))
-
-        # Row 3: шрифт
-        r = tk.Frame(settings, bg=Theme.SURFACE)
-        r.pack(fill="x", padx=16, pady=(4, 2))
-        tk.Label(r, text="Шрифт", font=("Segoe UI", 10),
-                 bg=Theme.SURFACE, fg=Theme.TEXT, width=14,
-                 anchor="w").pack(side="left")
-        self.font_value_lbl = tk.Label(r, text="15",
-                                       font=("Consolas", 10, "bold"),
-                                       bg=Theme.SURFACE,
-                                       fg=Theme.ACCENT, width=5)
-        self.font_value_lbl.pack(side="right")
-        self.font_scale = ttk.Scale(r, from_=10, to=26,
-                                    orient="horizontal",
-                                    style="Gold.Horizontal.TScale",
-                                    command=self._on_font_slider)
-        self.font_scale.set(15)
-        self.font_scale.pack(side="left", fill="x", expand=True,
-                             padx=(6, 10))
-
-        # Row 4: velocity
-        r = tk.Frame(settings, bg=Theme.SURFACE)
-        r.pack(fill="x", padx=16, pady=(4, 2))
-        tk.Label(r, text="Порог velocity", font=("Segoe UI", 10),
-                 bg=Theme.SURFACE, fg=Theme.TEXT, width=14,
-                 anchor="w").pack(side="left")
-        self.velocity_value_lbl = tk.Label(r, text="20",
-                                           font=("Consolas", 10, "bold"),
-                                           bg=Theme.SURFACE,
-                                           fg=Theme.ACCENT, width=5)
-        self.velocity_value_lbl.pack(side="right")
-        self.velocity_scale = ttk.Scale(r, from_=0, to=127,
-                                        orient="horizontal",
-                                        style="Gold.Horizontal.TScale",
-                                        command=self._on_velocity_slider)
-        self.velocity_scale.set(20)
-        self.velocity_scale.pack(side="left", fill="x", expand=True,
-                                 padx=(6, 10))
-
-        # Row 5: квантизация + разрывы
-        r = tk.Frame(settings, bg=Theme.SURFACE)
-        r.pack(fill="x", padx=16, pady=(4, 2))
-        tk.Label(r, text="Квантизация", font=("Segoe UI", 10),
-                 bg=Theme.SURFACE, fg=Theme.TEXT, width=14,
-                 anchor="w").pack(side="left")
-        self.quant_combo = ttk.Combobox(
-            r, textvariable=self.quantize_var, state="readonly",
-            values=["off", "1/4", "1/8", "1/16", "1/32"],
-            width=8, font=("Consolas", 10))
-        self.quant_combo.pack(side="left", padx=(0, 12))
-        self.quant_combo.bind("<<ComboboxSelected>>",
-                              lambda e: self._regroup_and_render())
-        tk.Label(r, text="Разрывы", font=("Segoe UI", 10),
-                 bg=Theme.SURFACE, fg=Theme.TEXT, width=9,
-                 anchor="w").pack(side="left")
-        self.breaks_combo = ttk.Combobox(
-            r, textvariable=self.breaks_var, state="readonly",
-            values=["realistic", "manual"], width=10,
-            font=("Consolas", 10))
-        self.breaks_combo.pack(side="left")
-        self.breaks_combo.bind("<<ComboboxSelected>>",
-                               lambda e: self._regroup_and_render())
-
-        # Row 6: чекбоксы
-        r = tk.Frame(settings, bg=Theme.SURFACE)
-        r.pack(fill="x", padx=16, pady=(4, 10))
-        tk.Checkbutton(r, text="  Авто-транспозиция (по аккорду)",
-                       variable=self.auto_transpose_var,
-                       command=self._regroup_and_render,
-                       bg=Theme.SURFACE, fg=Theme.TEXT,
-                       activebackground=Theme.SURFACE,
-                       activeforeground=Theme.ACCENT,
-                       selectcolor=Theme.SURFACE2,
-                       font=("Segoe UI", 10), bd=0,
-                       highlightthickness=0, anchor="w").pack(side="left")
-        tk.Checkbutton(r, text="  Маркеры транспозиции",
-                       variable=self.show_markers_var,
-                       command=self._regroup_and_render,
-                       bg=Theme.SURFACE, fg=Theme.TEXT,
-                       activebackground=Theme.SURFACE,
-                       activeforeground=Theme.ACCENT,
-                       selectcolor=Theme.SURFACE2,
-                       font=("Segoe UI", 10), bd=0,
-                       highlightthickness=0, anchor="w"
-                       ).pack(side="left", padx=(12, 0))
-        tk.Checkbutton(r, text="  Проверять обновления при запуске",
-                       variable=self.auto_update_var,
-                       command=self._on_auto_update_toggle,
-                       bg=Theme.SURFACE, fg=Theme.TEXT,
-                       activebackground=Theme.SURFACE,
-                       activeforeground=Theme.ACCENT,
-                       selectcolor=Theme.SURFACE2,
-                       font=("Segoe UI", 10), bd=0,
-                       highlightthickness=0, anchor="w"
-                       ).pack(side="left", padx=(12, 0))
-
-        # ---------- STATUS ----------
-        self.status_label = tk.Label(self.root, text=self.status_base,
-                                     font=("Segoe UI", 9),
-                                     bg=Theme.BG, fg=Theme.MUTED,
-                                     anchor="w", justify="left")
-        self.status_label.pack(fill="x", padx=26, pady=(0, 6))
-
-        # ---------- TEXT AREA ----------
-        wrap = tk.Frame(self.root, bg=Theme.SURFACE,
-                        highlightbackground=Theme.BORDER,
-                        highlightthickness=1)
-        wrap.pack(fill="both", expand=True, padx=26, pady=(0, 10))
-        sb = ttk.Scrollbar(wrap, orient="vertical",
-                           style="Vertical.TScrollbar")
-        sb.pack(side="right", fill="y", padx=(0, 1), pady=1)
-        self.text_area = tk.Text(
-            wrap, wrap="word", font=("Consolas", 15),
-            bg=Theme.SURFACE, fg=Theme.TEXT,
-            insertbackground=Theme.ACCENT,
-            selectbackground=Theme.SELECT, selectforeground=Theme.TEXT,
-            bd=0, relief="flat", padx=20, pady=16,
-            highlightthickness=0, spacing1=0, spacing2=6, spacing3=8,
-            yscrollcommand=sb.set)
-        self.text_area.pack(side="left", fill="both", expand=True)
-        sb.config(command=self.text_area.yview)
-        self.text_area.bind("<Double-Button-1>", self._on_double_click)
-        self.text_area.bind("<Button-3>", self._on_right_click)
-
-        self._configure_tags()
-        self.text_area.insert("1.0", "Ноты появятся здесь", "placeholder")
-        self.text_area.config(state="disabled")
-
-        # ---------- BUTTONS ROW 1 ----------
-        b1 = tk.Frame(self.root, bg=Theme.BG)
-        b1.pack(fill="x", padx=26, pady=(0, 4))
-        self.tracks_btn = StyledButton(b1, "🎵  Треки",
-                                       self.open_track_dialog, small=True)
-        self.tracks_btn.pack(side="left", expand=True, fill="x", padx=(0, 3))
-        self.autotr_btn = StyledButton(b1, "🎼  Авто-транспозиция",
-                                       self.auto_transpose_selection,
-                                       small=True)
-        self.autotr_btn.pack(side="left", expand=True, fill="x", padx=3)
-        self.undo_btn = StyledButton(b1, "↩  Undo (Ctrl+Z)",
-                                     self.undo, small=True)
-        self.undo_btn.pack(side="left", expand=True, fill="x", padx=(3, 0))
-
-        # ---------- BUTTONS ROW 2 ----------
-        b2 = tk.Frame(self.root, bg=Theme.BG)
-        b2.pack(fill="x", padx=26, pady=(0, 4))
-        self.copy_btn = StyledButton(b2, "📋  Текст", self.copy_result)
-        self.copy_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        self.code_btn = StyledButton(b2, "🧩  Код", self.copy_code)
-        self.code_btn.pack(side="left", expand=True, fill="x", padx=4)
-        self.save_btn = StyledButton(b2, "💾  Сохранить", self.save_result)
-        self.save_btn.pack(side="left", expand=True, fill="x", padx=4)
-        self.json_btn = StyledButton(b2, "🗂  JSON", self.export_json)
-        self.json_btn.pack(side="left", expand=True, fill="x", padx=4)
-        self.log_btn = StyledButton(b2, "📜  Лог", self.open_log)
-        self.log_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
-        self.log_btn.set_enabled(True)
-
-        # ---------- FOOTER ----------
-        tk.Label(self.root, text=f"AstraConv v{CURRENT_VERSION}  ·  SMisha2",
-                 font=("Segoe UI", 9),
-                 bg=Theme.BG, fg=Theme.MUTED).pack(pady=(2, 8))
-
-        self._ui_ready = True
-        self._update_density_slider_state()
-        self._update_buttons_state(False)
-
-    def _configure_tags(self):
-        if not getattr(self, "_ui_ready", False):
-            return
-        size = self.font_size_var.get()
-        self.text_area.tag_configure("placeholder",
-                                     foreground=Theme.MUTED,
-                                     justify="center",
-                                     spacing1=4, spacing3=4)
-        self.text_area.tag_configure("normal",
-                                     foreground=Theme.TEXT,
-                                     font=("Consolas", size),
-                                     justify="left",
-                                     spacing2=6, spacing3=8)
-        self.text_area.tag_configure("chord",
-                                     foreground=Theme.ACCENT,
-                                     font=("Consolas", size, "bold"),
-                                     justify="left",
-                                     spacing2=6, spacing3=8)
-        self.text_area.tag_configure("comment",
-                                     foreground=Theme.MUTED,
-                                     font=("Consolas", size, "italic"),
-                                     justify="left",
-                                     spacing1=2, spacing3=6)
-        self.text_area.tag_configure("oor",
-                                     foreground=Theme.ACCENT2,
-                                     font=("Consolas", size, "bold italic"),
-                                     justify="left")
-        self.text_area.tag_configure("error",
-                                     foreground=Theme.ERROR,
-                                     font=("Consolas", size),
-                                     justify="left")
-
-    def _update_buttons_state(self, has_sheet):
-        for b in (self.copy_btn, self.code_btn, self.save_btn,
-                  self.json_btn, self.autotr_btn, self.undo_btn,
-                  self.tracks_btn):
-            b.set_enabled(has_sheet)
-
-    # ------------------------------------------------------------
-    #  DnD
-    # ------------------------------------------------------------
-    def _dz_enter(self, _):
-        self.drop_zone.configure(highlightbackground=Theme.ACCENT)
-        self.drop_title.configure(fg=Theme.ACCENT)
-
-    def _dz_leave(self, _):
-        self.drop_zone.configure(highlightbackground=Theme.BORDER)
-        self.drop_title.configure(fg=Theme.TEXT)
-
-    def _setup_dnd(self):
-        try:
-            from tkinterdnd2 import DND_FILES
+            import pygame
+            pygame.mixer.init()
+            return True
         except ImportError:
-            return
-        for w in (self.drop_zone, self.drop_icon,
-                  self.drop_title, self.drop_hint):
-            try:
-                w.drop_target_register(DND_FILES)
-                w.dnd_bind("<<Drop>>", self.on_drop)
-            except Exception:
-                pass
-
-    def _setup_shortcuts(self):
-        self.root.bind("<Control-z>", lambda e: (self.undo(), "break")[1])
-        self.root.bind("<Control-Z>", lambda e: (self.undo(), "break")[1])
-        self.root.bind("<Control-s>",
-                       lambda e: (self._ctrl_s(), "break")[1])
-        self.root.bind("<Control-S>",
-                       lambda e: (self._ctrl_s(), "break")[1])
-        self.root.bind("<Control-c>", self._ctrl_c)
-        self.root.bind("<Control-C>", self._ctrl_c)
-        self.root.bind("<Control-k>",
-                       lambda e: (self.copy_code(), "break")[1])
-        self.root.bind("<Control-l>",
-                       lambda e: (self.open_log(), "break")[1])
-        self.root.bind("<Control-t>",
-                       lambda e: (self.auto_transpose_selection(),
-                                  "break")[1])
-        self.root.bind("<Control-u>",
-                       lambda e: (self.open_update_dialog(), "break")[1])
-
-    def _ctrl_s(self):
-        if self.save_btn.enabled:
-            self.save_result()
-
-    def _ctrl_c(self, _):
-        try:
-            sel = self.text_area.get("sel.first", "sel.last")
-            if sel.strip():
-                return
-        except tk.TclError:
-            pass
-        if self.copy_btn.enabled:
-            self.copy_result()
-            return "break"
-
-    # ------------------------------------------------------------
-    #  UPDATE
-    # ------------------------------------------------------------
-    def open_update_dialog(self):
-        UpdateDialog(self.root, silent=False)
-
-    def _auto_check_updates(self):
-        # тихая проверка, без диалога при отсутствии обновления
-        try:
-            UpdateDialog(self.root, silent=True)
+            return False
         except Exception:
-            pass
-
-    def _on_auto_update_toggle(self):
-        self._settings["check_updates_on_start"] = \
-            bool(self.auto_update_var.get())
-        save_local_settings(self._settings)
-
-    # ------------------------------------------------------------
-    #  слайдеры
-    # ------------------------------------------------------------
-    def _on_auto_toggle(self):
-        if not self._ui_ready:
-            return
-        if self.auto_density_var.get():
-            self._apply_auto_density()
-        self._update_density_slider_state()
-        self._render()
-
-    def _update_density_slider_state(self):
-        if not self._ui_ready:
-            return
-        state = "disabled" if self.auto_density_var.get() else "normal"
+            return False
+    
+    def check_fluidsynth(self):
+        """Проверка доступности fluidsynth"""
         try:
-            self.density_scale.state([state])
-        except Exception:
-            pass
-        color = Theme.MUTED if state == "disabled" else Theme.ACCENT
-        self.density_value_lbl.config(fg=color)
-
-    def _apply_auto_density(self):
-        v = self.last_auto_density
-        self.density_var.set(v)
-        self.density_value_lbl.config(text=str(v))
-        self._setting_density = True
-        try:
-            self.density_scale.set(v)
-        finally:
-            self._setting_density = False
-
-    def _on_density_slider(self, value):
-        if not self._ui_ready or self._setting_density:
-            return
-        if self.auto_density_var.get():
-            return
-        v = int(round(float(value)))
-        self.density_var.set(v)
-        self.density_value_lbl.config(text=str(v))
-        self._render()
-
-    def _on_font_slider(self, value):
-        if not self._ui_ready:
-            return
-        v = int(round(float(value)))
-        self.font_size_var.set(v)
-        self.font_value_lbl.config(text=str(v))
-        self._configure_tags()
-        self._render()
-
-    def _on_velocity_slider(self, value):
-        if not self._ui_ready:
-            return
-        v = int(round(float(value)))
-        self.velocity_var.set(v)
-        self.velocity_value_lbl.config(text=str(v))
-        if self._midi_data is not None:
-            self._regroup_and_render()
-
-    def _show_progress(self, show):
-        if show:
-            self.progress.pack(fill="x", padx=26, pady=(0, 6),
-                               before=self.status_label)
-            self.progress.start(12)
-        else:
-            try:
-                self.progress.stop()
-                self.progress.pack_forget()
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------
-    #  undo
-    # ------------------------------------------------------------
-    def _push_undo(self):
-        if self.current_chords:
-            self._undo_stack.append(
-                [ChordData(notes=list(c.notes),
-                           key_tokens=list(c.key_tokens),
-                           index=c.index, is_break=c.is_break,
-                           is_comment=c.is_comment, comment=c.comment)
-                 for c in self.current_chords])
-            if len(self._undo_stack) > self.MAX_UNDO:
-                self._undo_stack.pop(0)
-
-    def undo(self):
-        if not self._undo_stack:
-            self._flash("   ↪ нечего отменять", Theme.WARNING)
-            return
-        self.current_chords = self._undo_stack.pop()
-        self._render()
-        self._refresh_status()
-        self._flash("   ↩ отменено", Theme.SUCCESS)
-
-    # ------------------------------------------------------------
-    #  файлы
-    # ------------------------------------------------------------
-    def select_file(self):
-        path = filedialog.askopenfilename(
-            title="Выберите MIDI или аудио",
-            filetypes=[
-                ("Все поддерживаемые",
-                 "*.mid *.midi *.mp3 *.wav *.ogg *.flac *.m4a *.aac *.json"),
-                ("MIDI", "*.mid *.midi"),
-                ("Аудио", "*.mp3 *.wav *.ogg *.flac *.m4a *.aac"),
-                ("AstraConv sheet", "*.astra.json *.json"),
-                ("Все файлы", "*.*")])
-        if path:
-            self.process_file(path)
-
-    def on_drop(self, event):
-        path = event.data.strip("{}")
-        ext = os.path.splitext(path)[1].lower()
-        if ext in MIDI_EXTS or ext in AUDIO_EXTS or ext == ".json":
-            self.process_file(path)
-        else:
-            messagebox.showwarning("Ошибка", "Неподдерживаемый формат")
-
-    def process_file(self, path):
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".json":
-            self.import_json(path)
-            return
-
-        is_audio = ext in AUDIO_EXTS
-        self.current_is_audio = is_audio
-        cleanup_midi = None
-
-        try:
-            if is_audio:
-                self._set_status("⏳  Транскрипция аудио...", Theme.WARNING)
-                self.root.update_idletasks()
-                self._show_progress(True)
-                try:
-                    cleanup_midi = transcribe_audio_to_midi(path)
-                finally:
-                    self._show_progress(False)
-                if not cleanup_midi or not os.path.exists(cleanup_midi):
-                    raise RuntimeError("Транскрипция без файла")
-                midi_path = cleanup_midi
-            else:
-                midi_path = path
-
-            self._set_status("⏳  Разбор MIDI...", Theme.WARNING)
-            self.root.update_idletasks()
-
-            mappings = parse_freepiano_config(CONFIG_TEXT)
-            note_to_key, ctrl_notes = build_maps(mappings)
-            data = load_midi_events(midi_path)
-            bpm, _ = compute_timing(data)
-
-            self._midi_data = data
-            self._note_to_key = note_to_key
-            self._ctrl_notes = ctrl_notes
-            self._tracks_info = data.get('tracks_info', [])
-            self.current_file_path = path
-            self.last_bpm = bpm
-            self.last_auto_density = bpm_to_density(bpm)
-
-            window_ms = self._auto_window(data, audio_mode=is_audio)
-            self.last_auto_window_ms = window_ms
-
-            self.bpm_lbl.config(text=f"BPM: {bpm:.1f}", fg=Theme.ACCENT)
-
-            if self.auto_density_var.get():
-                self._apply_auto_density()
-
-            self._raw_notes = events_to_note_list(data)
-            self._undo_stack.clear()
-            self._regroup_and_render()
-            self._update_buttons_state(True)
-
-        except Exception as e:
-            self._handle_error(e, path)
-        finally:
-            if cleanup_midi and os.path.exists(cleanup_midi):
-                try:
-                    os.remove(cleanup_midi)
-                except Exception:
-                    pass
-
-    def _auto_window(self, data, audio_mode):
-        onsets = sorted(set(t for t, k, _, _ in data['events'] if k == 1))
-        if len(onsets) < 3:
-            return 25.0 if audio_mode else 0.0
-        bpm, ms_per_tick = compute_timing(data)
-        if bpm <= 0 or ms_per_tick <= 0:
-            return 25.0 if audio_mode else 0.0
-        beat_ms = 60000.0 / bpm
-        deltas = sorted((onsets[i + 1] - onsets[i]) * ms_per_tick
-                        for i in range(len(onsets) - 1))
-        deltas = [d for d in deltas if d > 0.5]
-        if len(deltas) < 2:
-            return 25.0 if audio_mode else 0.0
-        best_i, best_r = -1, 1.0
-        for i in range(1, len(deltas)):
-            r = deltas[i] / deltas[i - 1]
-            if r > best_r:
-                best_r, best_i = r, i
-        if best_i > 0 and best_r >= 2.2 and deltas[best_i] >= 15.0:
-            return min(deltas[best_i - 1], beat_ms / 8.0, 40.0)
-        if deltas[0] >= 20.0 and not audio_mode:
-            return 0.0
-        small = [d for d in deltas if d < 25.0]
-        if len(small) >= 3 and len(small) / len(deltas) > 0.25:
-            med = small[len(small) // 2]
-            cap = 40.0 if audio_mode else 30.0
-            return min(med * 2.0, beat_ms / 8.0, cap)
-        return 25.0 if audio_mode else 0.0
-
-    # ------------------------------------------------------------
-    #  перегруппировка
-    # ------------------------------------------------------------
-    def _regroup_and_render(self):
-        if self._midi_data is None or not self._raw_notes:
-            return
-        tpb = self._midi_data['ticks_per_beat']
-        _, ms_per_tick = compute_timing(self._midi_data)
-
-        notes = [NoteEvent(midi=n.midi, start_tick=n.start_tick,
-                           end_tick=n.end_tick, velocity=n.velocity,
-                           original_midi=n.original_midi)
-                 for n in self._raw_notes]
-        notes = quantize_events(notes, tpb, self.quantize_var.get())
-        notes.sort(key=lambda e: (e.start_tick, e.end_tick))
-
-        chords = group_into_chords(
-            notes, self._note_to_key, self._ctrl_notes,
-            self.last_auto_window_ms, ms_per_tick,
-            self.velocity_var.get(),
-            self.auto_transpose_var.get())
-
-        if self.breaks_var.get() == "realistic":
-            chords = insert_breaks_realistic(chords, self._midi_data)
-
-        if self.show_markers_var.get() and self.auto_transpose_var.get():
-            chords = inject_transpose_markers(chords)
-
-        for i, c in enumerate(chords):
-            c.index = i
-        self.current_chords = chords
-        self._render()
-        self._refresh_status()
-
-    def _refresh_status(self):
-        if not self.current_chords or not self.current_file_path:
-            return
-        total_notes = sum(len(c.notes) for c in self.current_chords)
-        chords_only = [c for c in self.current_chords
-                       if not c.is_break and not c.is_comment]
-        multi = sum(1 for c in chords_only if len(c.key_tokens) > 1)
-        max_c = max((len(c.key_tokens) for c in chords_only), default=0)
-        src = "MP3" if self.current_is_audio else "MIDI"
-
-        info = (f"✦  [{src}] "
-                f"{os.path.basename(self.current_file_path)}   ·   ")
-        info += f"шагов: {len(chords_only)}   ·   нот: {total_notes}"
-        if multi:
-            info += f"   ·   аккордов: {multi}"
-        if max_c > 1:
-            info += f" (макс: {max_c})"
-        info += f"   ·   окно: {self.last_auto_window_ms:.1f} мс"
-        if self.quantize_var.get() != "off":
-            info += f"   ·   квант: {self.quantize_var.get()}"
-        if self.auto_transpose_var.get():
-            info += "   ·   авто-транспозиция вкл"
-        self._set_status(info, Theme.SUCCESS)
-
-    # ------------------------------------------------------------
-    #  рендер
-    # ------------------------------------------------------------
-    def _render(self):
-        if not self._ui_ready:
-            return
-        self.text_area.config(state="normal")
-        self.text_area.delete("1.0", "end")
-
-        if not self.current_chords:
-            self.text_area.insert("1.0", "Ноты появятся здесь",
-                                  "placeholder")
-            self.result_text = ""
-            self.code_text = ""
-            self.text_area.config(state="disabled")
-            return
-
-        gap = " " * self.density_var.get()
-        tokens = []
-        for i, ch in enumerate(self.current_chords):
-            if ch.is_break:
-                self.text_area.insert("end", "\n")
-                tokens.append("\n")
-                continue
-            if ch.is_comment:
-                self.text_area.insert("end", ch.comment + "\n", "comment")
-                tokens.append("\n" + ch.comment)
-                continue
-            token = self._chord_to_token(ch.key_tokens)
-            tokens.append(token)
-            if any("'" in k for k in ch.key_tokens):
-                tag = "oor"
-            elif len(ch.key_tokens) > 1:
-                tag = "chord"
-            else:
-                tag = "normal"
-            self.text_area.insert("end", token, tag)
-            if gap and i != len(self.current_chords) - 1:
-                self.text_area.insert("end", gap, "sep")
-
-        if self.density_var.get() > 0:
-            self.result_text = (" " * self.density_var.get()).join(
-                t for t in tokens if t != "\n")
-        else:
-            self.result_text = "".join(t for t in tokens if t != "\n")
-        self.code_text = self._build_code(self.current_chords)
-        self.text_area.config(state="disabled")
-
-    @staticmethod
-    def _chord_to_token(keys):
-        if not keys:
-            return ""
-        if len(keys) == 1:
-            return keys[0]
-        return "[" + " ".join(keys) + "]"
-
-    @staticmethod
-    def _chord_to_code(keys):
-        if not keys:
-            return ""
-        if len(keys) == 1:
-            return f'"{keys[0]}"'
-        return "[" + ", ".join(f'"{k}"' for k in keys) + "]"
-
-    def _build_code(self, chords):
-        lines = []
-        for ch in chords:
-            if ch.is_break:
-                lines.append("")
-                continue
-            if ch.is_comment:
-                lines.append(f"    # {ch.comment}")
-                continue
-            if ch.key_tokens:
-                lines.append("    " + self._chord_to_code(ch.key_tokens) + ",")
-        return "[\n" + "\n".join(lines) + "\n]"
-
-    # ------------------------------------------------------------
-    #  click handling
-    # ------------------------------------------------------------
-    def _on_double_click(self, event):
-        if not self.current_chords:
-            return
-        idx = self._index_at_cursor(event)
-        if idx is None:
-            return
-        chord = self.current_chords[idx]
-        if chord.is_break or chord.is_comment:
-            return
-        self._push_undo()
-        dlg = ChordEditDialog(self.root, chord, idx)
-        if dlg.result is not None:
-            chord.key_tokens = dlg.result
-            self._render()
-            self._refresh_status()
-
-    def _on_right_click(self, event):
-        idx = self._index_at_cursor(event)
-        if idx is None:
-            return
-        chord = self.current_chords[idx]
-        menu = tk.Menu(self.root, tearoff=0,
-                       bg=Theme.SURFACE2, fg=Theme.TEXT,
-                       activebackground=Theme.ACCENT,
-                       activeforeground="#0a0a0a",
-                       bd=0, font=("Segoe UI", 10))
-
-        def edit():
-            if chord.is_break or chord.is_comment:
-                return
-            self._push_undo()
-            dlg = ChordEditDialog(self.root, chord, idx)
-            if dlg.result is not None:
-                chord.key_tokens = dlg.result
-                self._render()
-                self._refresh_status()
-
-        def remove():
-            self._push_undo()
-            self.current_chords.pop(idx)
-            self._render()
-            self._refresh_status()
-
-        def split_here():
-            self._push_undo()
-            self.current_chords.insert(
-                idx, ChordData(notes=[], key_tokens=[], is_break=True))
-            self._render()
-
-        if not (chord.is_break or chord.is_comment):
-            menu.add_command(label="✎  Изменить аккорд", command=edit)
-        menu.add_command(label="✂  Разрыв строки здесь",
-                         command=split_here)
-        menu.add_command(label="🗑  Удалить", command=remove)
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-
-    def _index_at_cursor(self, event):
-        try:
-            pos = self.text_area.index(f"@{event.x},{event.y}")
-            char_idx = self.text_area.count("1.0", pos, "chars")[0]
-        except Exception:
-            return None
-        running = 0
-        gap = self.density_var.get()
-        for i, ch in enumerate(self.current_chords):
-            if ch.is_break:
-                running += 1
-                continue
-            if ch.is_comment:
-                running += len(ch.comment) + 1
-                continue
-            tok = self._chord_to_token(ch.key_tokens)
-            if char_idx <= running + len(tok):
-                return i
-            running += len(tok) + (gap if i != len(self.current_chords) - 1
-                                    else 0)
-        return None
-
-    # ------------------------------------------------------------
-    #  tracks
-    # ------------------------------------------------------------
-    def open_track_dialog(self):
-        if not self._tracks_info:
-            messagebox.showinfo("Треки", "Сначала загрузите MIDI-файл")
-            return
-        dlg = TrackDialog(self.root, self._tracks_info)
-        if dlg.result is None:
-            return
-        for tr, sel in zip(self._tracks_info, dlg.result):
-            tr['selected'] = sel
-        self._reload_midi_with_tracks()
-
-    def _reload_midi_with_tracks(self):
-        if not self.current_file_path or not self._midi_data:
-            return
-        path = self._midi_data['path']
-        selected_idx = {i for i, tr in enumerate(self._tracks_info)
-                        if tr.get('selected', True)}
-        try:
-            mid = mido.MidiFile(path)
-            selected_tracks = [tr for i, tr in enumerate(mid.tracks)
-                               if i in selected_idx]
-            if not selected_tracks:
-                messagebox.showwarning("Треки", "Ни один трек не выбран")
-                return
-            merged = mido.merge_tracks(selected_tracks)
-            tempo_changes = []
-            events = []
-            tick = 0
-            for msg in merged:
-                tick += msg.time
-                if msg.type == 'set_tempo':
-                    tempo_changes.append((tick, msg.tempo))
-                elif msg.type == 'note_on' and msg.velocity > 0:
-                    events.append((tick, 1, msg.note, msg.velocity))
-                elif msg.type == 'note_off' or \
-                        (msg.type == 'note_on' and msg.velocity == 0):
-                    events.append((tick, 0, msg.note, 0))
-            events.sort(key=lambda e: (e[0], e[1]))
-            self._midi_data['events'] = events
-            self._midi_data['tempo_changes'] = tempo_changes
-            self._midi_data['total_ticks'] = tick
-            self._raw_notes = events_to_note_list(self._midi_data)
-            self._undo_stack.clear()
-            self._regroup_and_render()
-            self._flash("   🎵 треки обновлены", Theme.SUCCESS)
-        except Exception as e:
-            self._handle_error(e, path)
-
-    # ------------------------------------------------------------
-    #  auto-transpose selection
-    # ------------------------------------------------------------
-    def auto_transpose_selection(self):
-        if not self.current_chords:
-            return
-        try:
-            sel_start = self.text_area.index("sel.first")
-            sel_end = self.text_area.index("sel.last")
-            use_selection = True
-        except tk.TclError:
-            use_selection = False
-
-        if not use_selection:
-            idx_start, idx_end = 0, len(self.current_chords) - 1
-        else:
-            start_char = self.text_area.count("1.0", sel_start, "chars")[0]
-            end_char = self.text_area.count("1.0", sel_end, "chars")[0]
-            idx_start = idx_end = None
-            running = 0
-            gap = self.density_var.get()
-            for i, ch in enumerate(self.current_chords):
-                if ch.is_break:
-                    running += 1
-                    continue
-                if ch.is_comment:
-                    running += len(ch.comment) + 1
-                    continue
-                tok = self._chord_to_token(ch.key_tokens)
-                lo, hi = running, running + len(tok)
-                if idx_start is None and end_char >= lo:
-                    idx_start = i
-                if start_char <= hi:
-                    idx_end = i
-                running += len(tok) + (gap
-                                        if i != len(self.current_chords) - 1
-                                        else 0)
-            if idx_start is None:
-                idx_start = 0
-            if idx_end is None:
-                idx_end = len(self.current_chords) - 1
-
-        if idx_start > idx_end:
-            idx_start, idx_end = idx_end, idx_start
-
-        region_notes = []
-        for i in range(idx_start, idx_end + 1):
-            ch = self.current_chords[i]
-            if ch.is_break or ch.is_comment:
-                continue
-            region_notes.extend(ch.notes)
-        if not region_notes:
-            return
-
-        shift = best_transposition(region_notes, self._note_to_key,
-                                   self._ctrl_notes)
-        if shift == 0:
-            self._flash("   🎼 сдвиг не нужен", Theme.WARNING)
-            return
-
-        self._push_undo()
-        for i in range(idx_start, idx_end + 1):
-            ch = self.current_chords[i]
-            if ch.is_break or ch.is_comment:
-                continue
-            tokens = []
-            for n in ch.notes:
-                work = n.original_midi + shift
-                if work in self._ctrl_notes:
-                    continue
-                if work not in self._note_to_key:
-                    continue
-                key = self._note_to_key[work]
-                if shift != 0:
-                    key = key + "'"
-                if key not in tokens:
-                    tokens.append(key)
-            ch.key_tokens = tokens
-            for n in ch.notes:
-                n.shift = shift
-
-        if self.show_markers_var.get():
-            filtered = [c for c in self.current_chords
-                        if not c.is_comment
-                        or not c.comment.startswith("Transpose by:")]
-            self.current_chords = inject_transpose_markers(filtered)
-
-        self._render()
-        self._refresh_status()
-        self._flash(f"   🎼 транспонировано на {shift:+d}", Theme.SUCCESS)
-
-    # ------------------------------------------------------------
-    #  JSON
-    # ------------------------------------------------------------
-    def export_json(self):
-        if not self.current_chords:
-            return
-        path = filedialog.asksaveasfilename(
-            title="Сохранить как AstraConv sheet",
-            defaultextension=".astra.json",
-            filetypes=[("AstraConv sheet", "*.astra.json"),
-                       ("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            data = {
-                'version': 2,
-                'app_version': CURRENT_VERSION,
-                'source': os.path.basename(self.current_file_path or ''),
-                'bpm': self.last_bpm,
-                'settings': {
-                    'density': self.density_var.get(),
-                    'font_size': self.font_size_var.get(),
-                    'velocity': self.velocity_var.get(),
-                    'auto_transpose': self.auto_transpose_var.get(),
-                    'quantize': self.quantize_var.get(),
-                    'breaks': self.breaks_var.get(),
-                    'show_markers': self.show_markers_var.get(),
-                },
-                'chords': [],
-            }
-            for ch in self.current_chords:
-                if ch.is_break:
-                    data['chords'].append({'type': 'break'})
-                elif ch.is_comment:
-                    data['chords'].append(
-                        {'type': 'comment', 'text': ch.comment})
-                else:
-                    data['chords'].append({
-                        'type': 'chord',
-                        'notes': [{'midi': n.original_midi,
-                                   'shift': n.shift,
-                                   'velocity': n.velocity,
-                                   'start': n.start_tick,
-                                   'end': n.end_tick}
-                                  for n in ch.notes],
-                        'tokens': list(ch.key_tokens),
-                    })
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            self._flash("   🗂 JSON сохранён", Theme.SUCCESS)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}")
-
-    def import_json(self, path):
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось открыть: {e}")
-            return
-
-        chords = []
-        for raw in data.get('chords', []):
-            t = raw.get('type')
-            if t == 'break':
-                chords.append(ChordData(notes=[], key_tokens=[],
-                                        is_break=True))
-            elif t == 'comment':
-                chords.append(ChordData(notes=[], key_tokens=[],
-                                        is_comment=True,
-                                        comment=raw.get('text', '')))
-            elif t == 'chord':
-                notes = []
-                for nn in raw.get('notes', []):
-                    n = NoteEvent(midi=nn['midi'],
-                                  start_tick=nn.get('start', 0),
-                                  end_tick=nn.get('end', 0),
-                                  velocity=nn.get('velocity', 80),
-                                  original_midi=nn['midi'],
-                                  shift=nn.get('shift', 0))
-                    notes.append(n)
-                chords.append(ChordData(notes=notes,
-                                        key_tokens=list(raw.get('tokens', []))))
-        for i, c in enumerate(chords):
-            c.index = i
-
-        self.current_chords = chords
-        self._midi_data = None
-        self._raw_notes = []
-        self.current_file_path = path
-        self.current_is_audio = False
-        self._undo_stack.clear()
-
-        s = data.get('settings', {})
-        if 'density' in s:
-            self.density_var.set(s['density'])
-            self.density_value_lbl.config(text=str(s['density']))
-            self._setting_density = True
-            try:
-                self.density_scale.set(s['density'])
-            finally:
-                self._setting_density = False
-        if 'font_size' in s:
-            self.font_size_var.set(s['font_size'])
-            self.font_value_lbl.config(text=str(s['font_size']))
-            self.font_scale.set(s['font_size'])
-            self._configure_tags()
-        if 'velocity' in s:
-            self.velocity_var.set(s['velocity'])
-            self.velocity_value_lbl.config(text=str(s['velocity']))
-            self.velocity_scale.set(s['velocity'])
-        if 'auto_transpose' in s:
-            self.auto_transpose_var.set(s['auto_transpose'])
-        if 'quantize' in s:
-            self.quantize_var.set(s['quantize'])
-        if 'breaks' in s:
-            self.breaks_var.set(s['breaks'])
-        if 'show_markers' in s:
-            self.show_markers_var.set(s['show_markers'])
-
-        self._render()
-        self._update_buttons_state(True)
-        self._set_status(
-            f"✦  [JSON] {os.path.basename(path)}   ·   шагов: "
-            f"{len([c for c in chords if not c.is_break and not c.is_comment])}",
-            Theme.SUCCESS)
-        self._flash("   🗂 JSON загружен", Theme.SUCCESS)
-
-    # ------------------------------------------------------------
-    #  error handling
-    # ------------------------------------------------------------
-    def _handle_error(self, e, path):
-        self._midi_data = None
-        self.current_chords = []
-        self.current_file_path = None
-        self.bpm_lbl.config(text="BPM: —", fg=Theme.MUTED)
-        short = f"{type(e).__name__}: {e}"
-        if len(short) > 180:
-            short = short[:177] + "..."
-        self._set_status(f"✖  {short}", Theme.ERROR)
-
-        self.text_area.config(state="normal")
-        self.text_area.delete("1.0", "end")
-        lines = [
-            "Ошибка при обработке файла",
-            "",
-            f"Файл: {os.path.basename(path)}",
-            f"Тип:  {type(e).__name__}",
-            "",
-            str(e),
-            "",
-            "─── Traceback ───",
-            traceback.format_exc(),
+            from midi2audio import FluidSynth
+            return True
+        except ImportError:
+            return False
+    
+    def get_soundfont_path(self):
+        """Определение пути к SoundFont для Windows"""
+        # Проверяем стандартные места
+        possible_paths = [
+            os.path.join(os.environ.get('USERPROFILE', ''), 'Documents', 'SoundFonts', 'FluidR3_GM.sf2'),
+            os.path.join(os.environ.get('USERPROFILE', ''), 'SoundFonts', 'FluidR3_GM.sf2'),
+            'C:\\SoundFonts\\FluidR3_GM.sf2',
+            os.path.join(os.path.dirname(__file__), 'FluidR3_GM.sf2'),
+            os.path.join(os.path.dirname(__file__), 'soundfonts', 'FluidR3_GM.sf2')
         ]
-        if os.path.exists(TRANSCRIBE_LOG):
-            lines += ["",
-                      f"─── Лог: {TRANSCRIBE_LOG} ───",
-                      "(кнопка 📜 Лог чтобы открыть)"]
-        self.text_area.insert("1.0", "\n".join(lines), "error")
-        self.text_area.config(state="disabled")
-        self._update_buttons_state(False)
-
-    def _set_status(self, text, color=None):
-        self.status_base = text
-        self.status_label.config(text=text, fg=color or Theme.MUTED)
-
-    def _flash(self, suffix, color):
-        self.status_label.config(text=self.status_base + suffix, fg=color)
-        self.root.after(2000, lambda: self.status_label.config(
-            text=self.status_base, fg=Theme.MUTED))
-
-    # ------------------------------------------------------------
-    #  copy / save / log
-    # ------------------------------------------------------------
-    def copy_result(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.result_text)
-        self._flash("   📋 Текст скопирован", Theme.SUCCESS)
-
-    def copy_code(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.code_text)
-        self._flash("   🧩 Код скопирован", Theme.SUCCESS)
-
-    def save_result(self):
-        path = filedialog.asksaveasfilename(
-            title="Сохранить результат",
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
-        if path:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(self.result_text)
-            self._flash("   💾 Сохранено", Theme.SUCCESS)
-
-    def open_log(self):
-        if not os.path.exists(TRANSCRIBE_LOG):
-            messagebox.showinfo(
-                "Лог",
-                f"Лог появится после первой попытки транскрипции MP3.\n\n"
-                f"Путь: {TRANSCRIBE_LOG}")
-            return
-        try:
-            os.startfile(TRANSCRIBE_LOG)
-        except AttributeError:
-            import platform
-            if platform.system() == "Darwin":
-                subprocess.Popen(["open", TRANSCRIBE_LOG])
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        
+        return None
+    
+    def create_widgets(self):
+        """Создание современного интерфейса"""
+        # Основной контейнер с панелью навигации
+        main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Левая панель - навигация
+        nav_frame = ttk.Frame(main_pane, width=200)
+        nav_frame.pack_propagate(False)
+        
+        # Логотип и заголовок
+        logo_frame = ttk.Frame(nav_frame)
+        logo_frame.pack(fill=tk.X, padx=10, pady=15)
+        
+        logo_label = tk.Label(logo_frame, text="🎮 AstraConv", 
+                            font=("Segoe UI", 16, "bold"), 
+                            fg="#61afef", bg="#1e1e1e")
+        logo_label.pack(anchor=tk.W)
+        
+        subtitle_label = tk.Label(logo_frame, 
+                                text="MIDI → Игровые форматы",
+                                font=("Segoe UI", 9), fg="#a9a9a9", bg="#1e1e1e")
+        subtitle_label.pack(anchor=tk.W, pady=(0, 5))
+        
+        # Кнопки навигации
+        nav_buttons = [
+            ("🏠 Основное", "main"),
+            ("⚙️ Настройки", "settings"),
+            ("🎮 Minecraft", "minecraft"),
+            ("🎵 Roblox", "roblox"),
+            ("⛏️ Terraria", "terraria"),
+            ("📊 Визуализация", "visualization")
+        ]
+        
+        self.nav_buttons = {}
+        for text, tag in nav_buttons:
+            if tag == "main":
+                btn = ttk.Button(nav_frame, text=text, style="Accent.TButton")
             else:
-                subprocess.Popen(["xdg-open", TRANSCRIBE_LOG])
+                btn = ttk.Button(nav_frame, text=text, style="TButton")
+            btn.pack(fill=tk.X, padx=10, pady=5)
+            btn.bind("<Button-1>", lambda e, t=tag: self.switch_tab(t))
+            self.nav_buttons[tag] = btn
+        
+        # Правая панель - контент
+        self.content_frame = ttk.Frame(main_pane)
+        
+        # Добавление панелей в разделитель
+        main_pane.add(nav_frame)
+        main_pane.add(self.content_frame, weight=1)
+        
+        # Создание вкладок контента
+        self.tab_content = {}
+        
+        # Создаем все вкладки
+        self.create_main_tab()
+        self.create_settings_tab()
+        self.create_minecraft_tab()
+        self.create_roblox_tab()
+        self.create_terraria_tab()
+        self.create_visualization_tab()
+        
+        # Показываем основную вкладку
+        self.switch_tab("main")
+    
+    def create_main_tab(self):
+        """Создание основной вкладки"""
+        main_tab = ttk.Frame(self.content_frame)
+        self.tab_content["main"] = main_tab
+        
+        # Загрузка файла
+        load_frame = ttk.LabelFrame(main_tab, text="📁 Загрузка MIDI файла")
+        load_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        file_frame = ttk.Frame(load_frame)
+        file_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.file_label = ttk.Label(file_frame, text="Файл не выбран", font=self.subtitle_font)
+        self.file_label.pack(side=tk.LEFT, padx=5)
+        
+        btn_frame = ttk.Frame(load_frame)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Button(btn_frame, text="📂 Выбрать MIDI файл", command=self.load_midi_file).pack(side=tk.LEFT, padx=5)
+        if self.audio_available:
+            ttk.Button(btn_frame, text="▶️ Воспроизвести MIDI", command=self.play_midi).pack(side=tk.LEFT, padx=5)
+        
+        # Настройки обработки
+        settings_frame = ttk.LabelFrame(main_tab, text="⚙️ Настройки обработки")
+        settings_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        # Уровень детализации
+        detail_frame = ttk.Frame(settings_frame)
+        detail_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(detail_frame, text="Уровень детализации:", font=self.normal_font).pack(side=tk.LEFT)
+        
+        self.detail_var = tk.StringVar(value=self.settings['detail_level'])
+        detail_menu = ttk.OptionMenu(detail_frame, self.detail_var, self.settings['detail_level'],
+                                   "low", "medium", "high", "ultra")
+        detail_menu.pack(side=tk.LEFT, padx=10)
+        
+        # Порог аккордов
+        chord_frame = ttk.Frame(settings_frame)
+        chord_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(chord_frame, text="Порог аккордов:", font=self.normal_font).pack(side=tk.LEFT)
+        
+        self.chord_threshold = tk.DoubleVar(value=self.settings['chord_threshold'])
+        chord_scale = ttk.Scale(chord_frame, from_=0.01, to=0.2, 
+                              variable=self.chord_threshold, length=200)
+        chord_scale.pack(side=tk.LEFT, padx=10)
+        
+        ttk.Label(chord_frame, textvariable=self.chord_threshold, font=self.normal_font).pack(side=tk.LEFT, padx=5)
+        
+        # Дополнительные настройки
+        options_frame = ttk.Frame(settings_frame)
+        options_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.space_var = tk.BooleanVar(value=self.settings['space_between_chords'])
+        ttk.Checkbutton(options_frame, text="Пробелы между аккордами", variable=self.space_var).pack(side=tk.LEFT, padx=10)
+        
+        self.wrap_var = tk.BooleanVar(value=self.settings['wrap_text'])
+        ttk.Checkbutton(options_frame, text="Перенос строк", variable=self.wrap_var).pack(side=tk.LEFT, padx=10)
+        
+        # Результат обработки
+        result_frame = ttk.LabelFrame(main_tab, text="📤 Результат обработки")
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        
+        btn_container = ttk.Frame(result_frame)
+        btn_container.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Button(btn_container, text="🚀 Начать обработку", style="Accent.TButton", 
+                 command=self.start_processing).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_container, text="💾 Сохранить результат", command=self.save_result).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_container, text="📋 Копировать", command=self.copy_result).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_container, text="🗑️ Очистить", command=self.clear_result).pack(side=tk.LEFT, padx=5)
+        
+        # Поле результата
+        self.result_text = scrolledtext.ScrolledText(
+            result_frame, 
+            wrap=tk.WORD if self.settings['wrap_text'] else tk.NONE,
+            font=("Consolas", 11),
+            bg="#2d2d30",
+            fg="#d4d4d4",
+            insertbackground="#61afef",
+            highlightthickness=1,
+            highlightbackground="#444"
+        )
+        self.result_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.result_text.insert(tk.END, "Результат будет показан здесь после обработки...")
+        
+        # Информационная панель
+        info_frame = ttk.Frame(main_tab)
+        info_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        self.bpm_label = ttk.Label(info_frame, text="BPM: --", font=self.normal_font)
+        self.bpm_label.pack(side=tk.LEFT, padx=10)
+        
+        self.note_count_label = ttk.Label(info_frame, text="Нот: 0", font=self.normal_font)
+        self.note_count_label.pack(side=tk.LEFT, padx=10)
+        
+        self.chord_count_label = ttk.Label(info_frame, text="Аккордов: 0", font=self.normal_font)
+        self.chord_count_label.pack(side=tk.LEFT, padx=10)
+        
+        self.warning_label = ttk.Label(info_frame, text="", font=self.normal_font, foreground="#e06c75")
+        self.warning_label.pack(side=tk.RIGHT, padx=10)
+    
+    def create_settings_tab(self):
+        """Создание вкладки настроек"""
+        settings_tab = ttk.Frame(self.content_frame)
+        self.tab_content["settings"] = settings_tab
+        
+        # Заголовок
+        title_label = tk.Label(
+            settings_tab,
+            text="⚙️ Настройки AstraConv",
+            font=("Segoe UI", 18, "bold"),
+            fg="#61afef",
+            bg="#1e1e1e"
+        )
+        title_label.pack(fill=tk.X, padx=15, pady=15)
+        
+        # Уровень детализации
+        detail_frame = ttk.LabelFrame(settings_tab, text="Уровень детализации")
+        detail_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        self.detail_var_settings = tk.StringVar(value=self.settings['detail_level'])
+        
+        ttk.Radiobutton(detail_frame, text="Максимальная (каждая нота отдельно, аккорды сохраняются)",
+                      variable=self.detail_var_settings, value="high").pack(anchor="w", pady=2, padx=10)
+        ttk.Radiobutton(detail_frame, text="Стандартная (оптимальный баланс между деталями и читаемостью)",
+                      variable=self.detail_var_settings, value="medium").pack(anchor="w", pady=2, padx=10)
+        ttk.Radiobutton(detail_frame, text="Минимальная (группировка близких нот для упрощенного отображения)",
+                      variable=self.detail_var_settings, value="low").pack(anchor="w", pady=2, padx=10)
+        
+        # Анимации и фон
+        anim_frame = ttk.LabelFrame(settings_tab, text="Фон и анимации")
+        anim_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        self.anim_var = tk.BooleanVar(value=self.settings['animations'])
+        ttk.Checkbutton(anim_frame, text="Включить анимацию звезд",
+                      variable=self.anim_var).pack(anchor="w", pady=5, padx=10)
+        
+        self.bg_var = tk.BooleanVar(value=self.settings.get('background_enabled', True))
+        ttk.Checkbutton(anim_frame, text="Показывать фон со звездами",
+                      variable=self.bg_var).pack(anchor="w", pady=5, padx=10)
+        
+        # Форматирование текста
+        text_frame = ttk.LabelFrame(settings_tab, text="Форматирование текста")
+        text_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        self.wrap_var_settings = tk.BooleanVar(value=self.settings['wrap_text'])
+        ttk.Checkbutton(text_frame, text="Переносить текст на новую строку",
+                      variable=self.wrap_var_settings).pack(anchor="w", pady=5, padx=10)
+        
+        self.space_var_settings = tk.BooleanVar(value=self.settings['space_between_chords'])
+        ttk.Checkbutton(text_frame, text="Добавлять пробелы между аккордами",
+                      variable=self.space_var_settings).pack(anchor="w", pady=5, padx=10)
+        
+        # Порог аккордов
+        chord_frame = ttk.LabelFrame(settings_tab, text="Порог объединения нот в аккорды")
+        chord_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        explanation = (
+            "Этот параметр определяет, насколько близко по времени должны следовать ноты,\n"
+            "чтобы считаться частью одного аккорда. Меньшее значение делает аккорды более точными,\n"
+            "но может разбить действительно одновременные ноты. Значение в секундах."
+        )
+        tk.Label(chord_frame, text=explanation,
+                font=("Segoe UI", 9), bg="#1e1e1e", fg="#d4d4d4", justify="left", wraplength=500).pack(anchor="w", pady=5, padx=10)
+        
+        self.chord_threshold_var = tk.DoubleVar(value=self.settings['chord_threshold'])
+        chord_scale = tk.Scale(chord_frame, from_=0.01, to=0.1, resolution=0.005,
+                             orient="horizontal", variable=self.chord_threshold_var,
+                             font=("Segoe UI", 9), bg="#1e1e1e", fg="#d4d4d4",
+                             highlightthickness=0, troughcolor="#2d2d30")
+        chord_scale.pack(fill="x", pady=5, padx=10)
+        
+        # Добавляем примеры значений
+        example_frame = tk.Frame(chord_frame, bg="#1e1e1e")
+        example_frame.pack(fill="x", padx=10, pady=5)
+        tk.Label(example_frame, text="0.01с = Очень точные аккорды", font=("Segoe UI", 8), bg="#1e1e1e", fg="#c678dd").pack(side="left")
+        tk.Label(example_frame, text="0.05с = Стандарт (рекомендуется)", font=("Segoe UI", 8), bg="#1e1e1e", fg="#98c379").pack(side="left", padx=10)
+        tk.Label(example_frame, text="0.10с = Максимальная группировка", font=("Segoe UI", 8), bg="#1e1e1e", fg="#61afef").pack(side="left")
+        
+        # Кнопки применения
+        btn_frame = ttk.Frame(settings_tab)
+        btn_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        ttk.Button(btn_frame, text="Применить настройки", style="Accent.TButton",
+                 command=self.apply_settings).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Сбросить к стандартным", 
+                 command=self.reset_settings).pack(side=tk.RIGHT, padx=5)
+    
+    def create_minecraft_tab(self):
+        """Создание вкладки для Minecraft"""
+        mc_tab = ttk.Frame(self.content_frame)
+        self.tab_content["minecraft"] = mc_tab
+        
+        # Заголовок
+        title_label = tk.Label(
+            mc_tab,
+            text="🎮 Экспорт для Minecraft 1.21.9",
+            font=("Segoe UI", 18, "bold"),
+            fg="#61afef",
+            bg="#1e1e1e"
+        )
+        title_label.pack(fill=tk.X, padx=15, pady=15)
+        
+        # Описание
+        desc_frame = ttk.LabelFrame(mc_tab, text="Информация")
+        desc_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        desc_text = (
+            "Генерирует команды /setblock для создания нотных блоков в Minecraft 1.21.9\n"
+            "Поддерживаемые инструменты:\n"
+            "- harp (арфа) - для тихих нот\n"
+            "- basedrum (бас-барабан) - для средних по громкости нот\n"
+            "- pling (пианино) - для громких нот\n"
+            "Диапазон нот: C2-A3 (36-57 MIDI)"
+        )
+        tk.Label(desc_frame, text=desc_text,
+                font=("Segoe UI", 10), bg="#1e1e1e", fg="#d4d4d4", justify="left", wraplength=600).pack(pady=10, padx=10)
+        
+        # Кнопка генерации
+        btn_frame = ttk.Frame(mc_tab)
+        btn_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        ttk.Button(btn_frame, text="🚀 Сгенерировать команды Minecraft", style="Accent.TButton",
+                 command=self.generate_mc_commands).pack(side=tk.LEFT, padx=5)
+        
+        # Результат
+        result_frame = ttk.LabelFrame(mc_tab, text="Команды для Minecraft")
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        
+        self.mc_result = scrolledtext.ScrolledText(
+            result_frame, 
+            wrap=tk.WORD,
+            font=("Consolas", 11),
+            bg="#2d2d30",
+            fg="#61afef",
+            insertbackground="#61afef",
+            highlightthickness=1,
+            highlightbackground="#444"
+        )
+        self.mc_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.mc_result.insert(tk.END, "// Команды Minecraft появятся здесь после генерации")
+    
+    def create_roblox_tab(self):
+        """Создание вкладки для Roblox"""
+        rb_tab = ttk.Frame(self.content_frame)
+        self.tab_content["roblox"] = rb_tab
+        
+        # Заголовок
+        title_label = tk.Label(
+            rb_tab,
+            text="🎵 Экспорт для Roblox Piano",
+            font=("Segoe UI", 18, "bold"),
+            fg="#98c379",
+            bg="#1e1e1e"
+        )
+        title_label.pack(fill=tk.X, padx=15, pady=15)
+        
+        # Описание
+        desc_frame = ttk.LabelFrame(rb_tab, text="Информация")
+        desc_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        desc_text = (
+            "Генерирует Lua скрипт для автоматического воспроизведения на Roblox пианино\n"
+            "Требуется настройка скрипта под вашу модель пианино\n"
+            "Поддерживает громкость для эффектов нажатия клавиш\n"
+            "Диапазон нот: C1-C7 (все доступные ноты)"
+        )
+        tk.Label(desc_frame, text=desc_text,
+                font=("Segoe UI", 10), bg="#1e1e1e", fg="#d4d4d4", justify="left", wraplength=600).pack(pady=10, padx=10)
+        
+        # Кнопка генерации
+        btn_frame = ttk.Frame(rb_tab)
+        btn_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        ttk.Button(btn_frame, text="🚀 Экспортировать Lua скрипт для Roblox", style="Accent.TButton",
+                 command=self.export_roblox_script).pack(side=tk.LEFT, padx=5)
+        
+        # Результат
+        result_frame = ttk.LabelFrame(rb_tab, text="Lua скрипт для Roblox")
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        
+        self.rb_result = scrolledtext.ScrolledText(
+            result_frame, 
+            wrap=tk.WORD,
+            font=("Consolas", 11),
+            bg="#2d2d30",
+            fg="#98c379",
+            insertbackground="#98c379",
+            highlightthickness=1,
+            highlightbackground="#444"
+        )
+        self.rb_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.rb_result.insert(tk.END, "-- Lua скрипт для Roblox появится здесь после экспорта")
+    
+    def create_terraria_tab(self):
+        """Создание вкладки для Terraria"""
+        terraria_tab = ttk.Frame(self.content_frame)
+        self.tab_content["terraria"] = terraria_tab
+        
+        # Заголовок
+        title_label = tk.Label(
+            terraria_tab,
+            text="⛏️ Экспорт для Terraria Music Box",
+            font=("Segoe UI", 18, "bold"),
+            fg="#c678dd",
+            bg="#1e1e1e"
+        )
+        title_label.pack(fill=tk.X, padx=15, pady=15)
+        
+        # Описание
+        desc_frame = ttk.LabelFrame(terraria_tab, text="Информация")
+        desc_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        desc_text = (
+            "Генерирует данные в формате для музыкальной шкатулки Terraria\n"
+            "Поддерживает ноты только в диапазоне C3-C5 (48-72 MIDI)\n"
+            "Формат: номер_удара: нота1 нота2...\n"
+            "Для импорта скопируйте результат в файл .txt и используйте в Terraria"
+        )
+        tk.Label(desc_frame, text=desc_text,
+                font=("Segoe UI", 10), bg="#1e1e1e", fg="#d4d4d4", justify="left", wraplength=600).pack(pady=10, padx=10)
+        
+        # Кнопка генерации
+        btn_frame = ttk.Frame(terraria_tab)
+        btn_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        ttk.Button(btn_frame, text="🚀 Экспортировать для Terraria", style="Accent.TButton",
+                 command=self.export_terraria_music_box).pack(side=tk.LEFT, padx=5)
+        
+        # Результат
+        result_frame = ttk.LabelFrame(terraria_tab, text="Данные для Terraria Music Box")
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        
+        self.terraria_result = scrolledtext.ScrolledText(
+            result_frame, 
+            wrap=tk.WORD,
+            font=("Consolas", 11),
+            bg="#2d2d30",
+            fg="#c678dd",
+            insertbackground="#c678dd",
+            highlightthickness=1,
+            highlightbackground="#444"
+        )
+        self.terraria_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.terraria_result.insert(tk.END, "# Данные для Terraria появятся здесь после экспорта")
+    
+    def create_visualization_tab(self):
+        """Создание вкладки визуализации"""
+        viz_tab = ttk.Frame(self.content_frame)
+        self.tab_content["visualization"] = viz_tab
+        
+        # Заголовок
+        title_label = tk.Label(
+            viz_tab,
+            text="📊 Визуализация MIDI файла",
+            font=("Segoe UI", 18, "bold"),
+            fg="#e5c07b",
+            bg="#1e1e1e"
+        )
+        title_label.pack(fill=tk.X, padx=15, pady=15)
+        
+        # Описание
+        desc_frame = ttk.LabelFrame(viz_tab, text="Информация")
+        desc_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        desc_text = (
+            "Визуализация нот MIDI файла в реальном времени\n"
+            "Показывает, какие ноты играются и когда\n"
+            "Подсветка клавиш при воспроизведении\n"
+            "Требуется загруженный MIDI файл"
+        )
+        tk.Label(desc_frame, text=desc_text,
+                font=("Segoe UI", 10), bg="#1e1e1e", fg="#d4d4d4", justify="left", wraplength=600).pack(pady=10, padx=10)
+        
+        # Кнопки управления
+        btn_frame = ttk.Frame(viz_tab)
+        btn_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        self.play_btn = ttk.Button(btn_frame, text="▶️ Начать визуализацию", 
+                                 command=self.play_visualization)
+        self.play_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="⏹️ Стоп", 
+                                 command=self.stop_visualization, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Canvas для визуализации
+        viz_frame = ttk.LabelFrame(viz_tab, text="Визуализация нот")
+        viz_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        
+        self.viz_canvas = tk.Canvas(viz_frame, height=150, bg="#2d2d30", highlightthickness=1, 
+                                  highlightbackground="#444")
+        self.viz_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Отрисовка клавиатуры
+        self.draw_keyboard()
+    
+    def draw_keyboard(self):
+        """Отрисовка клавиатуры для визуализации"""
+        if not hasattr(self, 'viz_canvas'):
+            return
+            
+        self.viz_canvas.delete("all")
+        width = self.viz_canvas.winfo_width() or 1000
+        height = 150
+        
+        # Белые клавиши
+        white_keys = 15
+        white_width = width // white_keys
+        
+        for i in range(white_keys):
+            x1 = i * white_width
+            x2 = x1 + white_width
+            self.viz_canvas.create_rectangle(x1, 10, x2, height-10, 
+                                            fill="#FFFFFF", outline="#444")
+        
+        # Чёрные клавиши (упрощённо)
+        black_keys = [1, 3, 6, 8, 10]  # Позиции чёрных клавиш
+        black_width = white_width * 0.6
+        
+        for i in black_keys:
+            if i < white_keys:
+                x1 = i * white_width - black_width//2
+                x2 = x1 + black_width
+                self.viz_canvas.create_rectangle(x1, 10, x2, height//2, 
+                                                fill="#333", outline="#444")
+    
+    def switch_tab(self, tab_name):
+        """Переключение между вкладками"""
+        # Сброс стилей кнопок
+        for btn in self.nav_buttons.values():
+            btn.configure(style="TButton")
+        
+        # Установка стиля для активной кнопки
+        self.nav_buttons[tab_name].configure(style="Accent.TButton")
+        
+        # Скрытие всех вкладок
+        for tab in self.tab_content.values():
+            tab.pack_forget()
+        
+        # Отображение выбранной вкладки
+        self.tab_content[tab_name].pack(fill=tk.BOTH, expand=True)
+        self.current_tab = tab_name
+        
+        # Обновление отображения при переключении на вкладку визуализации
+        if tab_name == "visualization":
+            self.draw_keyboard()
+    
+    def apply_settings(self):
+        """Применение настроек"""
+        self.settings['detail_level'] = self.detail_var_settings.get()
+        self.settings['animations'] = self.anim_var.get()
+        self.settings['background_enabled'] = self.bg_var.get()
+        self.settings['wrap_text'] = self.wrap_var_settings.get()
+        self.settings['chord_threshold'] = self.chord_threshold_var.get()
+        self.settings['space_between_chords'] = self.space_var_settings.get()
+        
+        # Обновление интерфейса
+        self.result_text.config(wrap=tk.WORD if self.settings['wrap_text'] else tk.NONE)
+        
+        # Перезапуск фона при необходимости
+        if hasattr(self, 'canvas') and self.canvas:
+            self.canvas.delete("all")
+            if self.settings['background_enabled'] and self.settings['animations']:
+                self.init_stars()
+        
+        # Сохранение настроек
+        self.save_settings()
+        
+        self.status_var.set(f"Настройки применены | Уровень детализации: {self.settings['detail_level']}")
+    
+    def reset_settings(self):
+        """Сброс настроек к значениям по умолчанию"""
+        self.settings = {
+            'detail_level': 'medium',
+            'animations': True,
+            'wrap_text': False,
+            'chord_threshold': 0.025,
+            'max_notes': 100000,
+            'show_unmapped': True,
+            'space_between_chords': True,
+            'background_enabled': True
+        }
+        
+        # Обновление интерфейса
+        self.detail_var_settings.set(self.settings['detail_level'])
+        self.anim_var.set(self.settings['animations'])
+        self.bg_var.set(self.settings['background_enabled'])
+        self.wrap_var_settings.set(self.settings['wrap_text'])
+        self.chord_threshold_var.set(self.settings['chord_threshold'])
+        self.space_var_settings.set(self.settings['space_between_chords'])
+        
+        self.result_text.config(wrap=tk.WORD if self.settings['wrap_text'] else tk.NONE)
+        
+        # Перезапуск фона
+        if hasattr(self, 'canvas') and self.canvas:
+            self.canvas.delete("all")
+            if self.settings['background_enabled'] and self.settings['animations']:
+                self.init_stars()
+        
+        # Сохранение настроек
+        self.save_settings()
+        
+        self.status_var.set("Настройки сброшены к значениям по умолчанию")
+    
+    def load_settings(self):
+        """Загрузка настроек из файла"""
+        try:
+            settings_path = "astrconv_settings.json"
+            if os.path.exists(settings_path):
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    loaded_settings = json.load(f)
+                    self.settings.update(loaded_settings)
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось открыть: {e}")
+            print(f"Ошибка загрузки настроек: {e}")
+    
+    def save_settings(self):
+        """Сохранение настроек в файл"""
+        try:
+            settings_path = "astrconv_settings.json"
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception as e:
+            print(f"Ошибка сохранения настроек: {e}")
+    
+    def load_midi_file(self):
+        """Загрузка MIDI файла"""
+        self.midi_path = filedialog.askopenfilename(
+            filetypes=[("MIDI files", "*.mid *.midi"), ("All files", "*.*")]
+        )
+        
+        if self.midi_path:
+            filename = os.path.basename(self.midi_path)
+            self.file_label.config(text=f"Выбран файл: {filename}")
+            self.status_var.set(f"Загружен файл: {filename}")
+            
+            # Очистка предыдущих результатов
+            self.result_text.delete(1.0, tk.END)
+            self.result_text.insert(tk.END, "Файл загружен. Нажмите 'Начать обработку' для конвертации.")
+    
+    def process_midi_background(self, game_format=None):
+        """Фоновая обработка MIDI"""
+        try:
+            # Создание обработчика
+            processor = MidiProcessor({
+                'detail_level': self.detail_var.get(),
+                'chord_threshold': self.chord_threshold.get(),
+                'space_between_chords': self.space_var.get(),
+                'max_notes': self.settings['max_notes'],
+                'wrap_text': self.wrap_var.get()
+            })
+            
+            # Обработка
+            result = processor.process_midi(self.midi_path, game_format)
+            
+            # Обновление интерфейса
+            self.root.after(0, lambda: self.update_result(result))
+            
+        except Exception as e:
+            error_msg = f"Ошибка обработки:\n{str(e)}"
+            self.root.after(0, lambda: self.result_text.insert(tk.END, error_msg))
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self.status_var.set("Обработка завершена | Готов к работе"))
+    
+    def update_result(self, result):
+        """Обновление результатов обработки"""
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, result)
+        
+        # Обновление информационной панели
+        if "Ошибка" in result or "Файл слишком большой" in result:
+            self.warning_label.config(text="⚠️ Ошибка обработки")
+        else:
+            # Простой подсчет нот и аккордов для демонстрации
+            note_count = sum(1 for c in result if c in white_keys + black_keys)
+            chord_count = result.count('[') + result.count(']')
+            self.note_count_label.config(text=f"Нот: {note_count}")
+            self.chord_count_label.config(text=f"Аккордов: {chord_count}")
+            self.warning_label.config(text="")
+    
+    def start_processing(self):
+        """Начало обработки MIDI файла"""
+        if not self.midi_path:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите MIDI файл!")
+            return
+        
+        if self.processing:
+            messagebox.showinfo("Информация", "Обработка уже запущена!")
+            return
+        
+        # Отображение статуса
+        self.status_var.set("Обработка начинается...")
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, "Обработка начинается...\n")
+        self.root.update()
+        
+        # Запуск в отдельном потоке
+        self.processing = True
+        threading.Thread(target=self.process_midi_background, daemon=True).start()
+    
+    def save_result(self):
+        """Сохранение результата в файл"""
+        content = self.result_text.get(1.0, tk.END).strip()
+        
+        if not content or content == "Результат будет показан здесь после обработки...":
+            messagebox.showinfo("Информация", "Нет данных для сохранения!")
+            return
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[
+                ("Текстовые файлы", "*.txt"),
+                ("JSON файлы", "*.json"),
+                ("Lua скрипты", "*.lua"),
+                ("Все файлы", "*.*")
+            ]
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                self.status_var.set(f"✅ Результат сохранён: {os.path.basename(file_path)}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{str(e)}")
+    
+    def copy_result(self):
+        """Копирование результата"""
+        if self.copying_in_progress:
+            return
+        
+        content = self.result_text.get(1.0, tk.END).strip()
+        
+        if not content or content == "Результат будет показан здесь после обработки...":
+            messagebox.showinfo("Информация", "Нет данных для копирования!")
+            return
+        
+        try:
+            self.copying_in_progress = True
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            self.status_var.set("✅ Результат скопирован в буфер обмена!")
+            
+            # Эффектная анимация подсветки
+            original_bg = self.result_text.cget("bg")
+            self.result_text.config(bg="#3a3a00")
+            
+            def fade_back(step=0):
+                if step < 8:
+                    intensity = 1.0 - step * 0.12
+                    color = f'#{int(58*intensity):02x}{int(58*intensity):02x}{int(0):02x}'
+                    self.result_text.config(bg=color)
+                    self.root.after(50, lambda: fade_back(step + 1))
+                else:
+                    self.result_text.config(bg=original_bg)
+            
+            fade_back()
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось скопировать в буфер обмена:\n{str(e)}")
+        finally:
+            self.copying_in_progress = False
+            self.root.after(2000, lambda: self.status_var.set("Готов к работе | AstraConv v0.0.6"))
+    
+    def clear_result(self):
+        """Очистка результатов"""
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, "Результат будет показан здесь после обработки...")
+        self.note_count_label.config(text="Нот: 0")
+        self.chord_count_label.config(text="Аккордов: 0")
+        self.warning_label.config(text="")
+        self.status_var.set("Результаты очищены")
+    
+    def generate_mc_commands(self):
+        """Генерация команд для Minecraft"""
+        if not self.midi_path:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите MIDI файл!")
+            return
+        
+        self.status_var.set("Генерация команд Minecraft...")
+        self.root.update()
+        
+        processor = MidiProcessor()
+        commands = processor.process_midi(self.midi_path, "minecraft")
+        
+        self.mc_result.delete(1.0, tk.END)
+        self.mc_result.insert(tk.END, commands)
+        
+        # Копирование в буфер
+        self.root.clipboard_clear()
+        self.root.clipboard_append(commands)
+        
+        self.status_var.set("✅ Команды Minecraft скопированы в буфер обмена!")
+        self.root.after(3000, lambda: self.status_var.set("Готов к работе | AstraConv v0.0.6"))
+    
+    def export_roblox_script(self):
+        """Экспорт Lua скрипта для Roblox"""
+        if not self.midi_path:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите MIDI файл!")
+            return
+        
+        self.status_var.set("Генерация Lua скрипта для Roblox...")
+        self.root.update()
+        
+        processor = MidiProcessor()
+        script = processor.process_midi(self.midi_path, "roblox")
+        
+        self.rb_result.delete(1.0, tk.END)
+        self.rb_result.insert(tk.END, script)
+        
+        self.status_var.set("✅ Lua скрипт для Roblox сгенерирован!")
+        self.root.after(3000, lambda: self.status_var.set("Готов к работе | AstraConv v0.0.6"))
+    
+    def export_terraria_music_box(self):
+        """Экспорт данных для Terraria"""
+        if not self.midi_path:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите MIDI файл!")
+            return
+        
+        self.status_var.set("Генерация данных для Terraria...")
+        self.root.update()
+        
+        processor = MidiProcessor()
+        data = processor.process_midi(self.midi_path, "terraria")
+        
+        self.terraria_result.delete(1.0, tk.END)
+        self.terraria_result.insert(tk.END, data)
+        
+        self.status_var.set("✅ Данные для Terraria сгенерированы!")
+        self.root.after(3000, lambda: self.status_var.set("Готов к работе | AstraConv v0.0.6"))
+    
+    def play_midi(self):
+        """Воспроизведение MIDI файла"""
+        if not self.midi_path:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите MIDI файл!")
+            return
+        
+        if not self.audio_available:
+            messagebox.showwarning("Предупреждение", "Аудио недоступно. Проверьте установку SoundFont.")
+            return
+        
+        try:
+            from midi2audio import FluidSynth
+            import pygame
+            
+            # Конвертация MIDI в WAV для воспроизведения
+            wav_path = "temp_audio.wav"
+            fs = FluidSynth(self.soundfont_path)
+            fs.midi_to_audio(self.midi_path, wav_path)
+            
+            # Воспроизведение
+            pygame.mixer.music.load(wav_path)
+            pygame.mixer.music.play()
+            
+            self.status_var.set("▶️ Воспроизведение MIDI...")
+            while pygame.mixer.music.get_busy():
+                self.root.update()
+                time.sleep(0.1)
+            
+            # Удаляем временный файл
+            if os.path.exists(wav_path):
+                pygame.mixer.music.unload()
+                os.remove(wav_path)
+            
+            self.status_var.set("Готов к работе | AstraConv v0.0.6")
+        except Exception as e:
+            error_msg = f"Ошибка воспроизведения:\n{str(e)}"
+            messagebox.showerror("Ошибка", error_msg)
+            self.status_var.set("Ошибка воспроизведения | Проверьте SoundFont")
+    
+    def play_visualization(self):
+        """Запуск визуализации воспроизведения"""
+        if not self.midi_path:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите MIDI файл!")
+            return
+        
+        self.visualization_active = True
+        self.play_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.status_var.set("▶️ Визуализация запущена...")
+        
+        # Запуск в отдельном потоке
+        self.visualization_thread = threading.Thread(target=self._visualization_worker, daemon=True)
+        self.visualization_thread.start()
+    
+    def stop_visualization(self):
+        """Остановка визуализации"""
+        self.visualization_active = False
+        self.play_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_var.set("Готов к работе | AstraConv v0.0.6")
+        
+        # Очистка подсветки клавиш
+        if hasattr(self, 'viz_canvas'):
+            self.viz_canvas.delete("highlight")
+    
+    def _visualization_worker(self):
+        """Рабочий поток для визуализации"""
+        try:
+            import mido
+            midi_file = mido.MidiFile(self.midi_path)
+            
+            # Воспроизведение с визуализацией
+            start_time = time.time()
+            current_time = 0
+            
+            for msg in midi_file:
+                if not self.visualization_active:
+                    break
+                
+                if hasattr(msg, 'time'):
+                    current_time += msg.time
+                
+                # Ожидание до следующего события
+                elapsed = time.time() - start_time
+                wait_time = current_time - elapsed
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                
+                # Визуализация ноты
+                if hasattr(msg, 'type') and msg.type == 'note_on' and hasattr(msg, 'velocity') and msg.velocity > 0:
+                    self._highlight_key(msg.note)
+        
+        except Exception as e:
+            print(f"Ошибка визуализации: {e}")
+        finally:
+            self.root.after(0, self.stop_visualization)
+    
+    def _highlight_key(self, midi_note):
+        """Подсветка клавиши на визуализации"""
+        if not hasattr(self, 'viz_canvas') or not self.visualization_active:
+            return
+        
+        # Простая реализация - определение позиции клавиши
+        key_position = (midi_note - 36) % 15  # 15 белых клавиш на октаву
+        width = self.viz_canvas.winfo_width() or 1000
+        white_width = width // 15
+        
+        x1 = key_position * white_width
+        x2 = x1 + white_width
+        
+        # Создание подсветки
+        self.viz_canvas.delete("highlight")
+        highlight = self.viz_canvas.create_rectangle(x1, 10, x2, 160, 
+                                                   fill="#00FF00", 
+                                                   stipple="gray50",
+                                                   tags="highlight")
+        
+        # Автоматическое удаление через 200мс
+        self.root.after(200, lambda: self.viz_canvas.delete(highlight))
+    
+    def init_stars(self):
+        """Инициализация мерцающих звезд для фона"""
+        if not self.settings.get('background_enabled', True) or not self.settings.get('animations', True):
+            return
+        
+        # Создаем canvas для фона
+        self.canvas = tk.Canvas(self.root, bg="#1e1e1e", highlightthickness=0)
+        self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.canvas.lower("all")
+        
+        # Создаем звезды
+        self.stars = []
+        for _ in range(70):
+            x = random.randint(50, self.root.winfo_width() - 50)
+            y = random.randint(50, self.root.winfo_height() - 50)
+            size = random.uniform(0.5, 1.5)
+            brightness = random.uniform(0.4, 1.0)
+            star = self.canvas.create_oval(
+                x - size, y - size, x + size, y + size,
+                fill=self._get_star_color(brightness),
+                outline=""
+            )
+            self.stars.append({
+                'id': star,
+                'x': x,
+                'y': y,
+                'size': size,
+                'brightness': brightness,
+                'phase': random.uniform(0, 2 * math.pi),
+                'speed': random.uniform(0.02, 0.05)
+            })
+        
+        # Запускаем анимацию
+        self.animate_stars()
+    
+    def _get_star_color(self, brightness):
+        """Получает цвет звезды в зависимости от яркости"""
+        if brightness > 0.8:
+            return "#FFFFFF"  # Белый для самых ярких
+        elif brightness > 0.6:
+            return "#FFD700"  # Золотой для средних
+        else:
+            return "#DAA520"  # Темно-золотой для тусклых
+    
+    def animate_stars(self):
+        """Анимация мерцающих звезд"""
+        if not self.settings.get('animations', True) or not hasattr(self, 'canvas'):
+            return
+        
+        for star in self.stars:
+            star['phase'] += star['speed']
+            # Плавное изменение яркости
+            brightness = 0.4 + 0.6 * abs(math.sin(star['phase']))
+            star['brightness'] = brightness
+            
+            # Обновляем цвет звезды
+            try:
+                self.canvas.itemconfig(
+                    star['id'],
+                    fill=self._get_star_color(brightness)
+                )
+            except tk.TclError:
+                # Игнорируем ошибку если элемент уже удален
+                pass
+        
+        # Планируем следующий кадр
+        if hasattr(self, 'root') and self.root:
+            self.root.after(40, self.animate_stars)
 
+def check_dependencies():
+    """Проверка необходимых зависимостей"""
+    required = ['mido', 'pygame']
+    missing = []
+    
+    for module in required:
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    
+    return missing
 
-# ═══════════════════════════════════════════════════════════════════
-#                              ЗАПУСК
-# ═══════════════════════════════════════════════════════════════════
+def show_dependency_error():
+    """Показать ошибку о зависимостях"""
+    root = tk.Tk()
+    root.withdraw()
+    error_msg = "⚠️ Отсутствуют необходимые зависимости для работы AstraConv:\n\n"
+    error_msg += "Установите их командами:\n"
+    error_msg += "pip install mido pygame\n\n"
+    error_msg += "Для работы с SoundFont (воспроизведение MIDI):\n"
+    error_msg += "pip install midi2audio\n\n"
+    error_msg += "Для полноценной работы скачайте SoundFont файл FluidR3_GM.sf2\n"
+    error_msg += "и поместите его в папку C:\\SoundFonts\\\n\n"
+    error_msg += "Программа продолжит работу в ограниченном режиме."
+    messagebox.showwarning("Зависимости не установлены", error_msg)
+    root.destroy()
+
+def main():
+    """Основная функция запуска приложения"""
+    # Проверка базовых зависимостей
+    missing_deps = check_dependencies()
+    
+    if missing_deps:
+        show_dependency_error()
+    
+    # Создание основного окна
+    root = tk.Tk()
+    
+    # Запрещаем изменение размера окна
+    root.resizable(True, True)
+    
+    # Запуск приложения
+    app = AstrConvApp(root)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.mainloop()
 
 if __name__ == "__main__":
-    try:
-        from tkinterdnd2 import TkinterDnD
-        root = TkinterDnD.Tk()
-    except ImportError:
-        root = tk.Tk()
-    app = AstraConvGUI(root)
-    root.mainloop()
+    main()
