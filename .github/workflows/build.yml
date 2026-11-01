@@ -1,4 +1,5 @@
-name: Build and Release AstraConv
+# .github/workflows/build.yml
+name: AstraConv v0.0.7 — by black
 
 on:
   push:
@@ -137,7 +138,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          name: AstraConv ${{ github.ref_name }}
+          name: AstraConv ${{ github.ref_name }} — by black
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: dist/AstraConv.exe
