@@ -4,7 +4,7 @@
 
 <br>
 
-### 🎹 MIDI → Minecraft · Roblox · Terraria
+### 🎹 MIDI → Roblox
 
 <br>
 
